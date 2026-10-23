@@ -67,8 +67,8 @@ Applying AI to optimize system operations and infrastructure.
 
 | Model | Validation RMSE |
 |---|---|
-| Linear Regression | 216.91246617869817 |
-| Lasso (alpha=0.01) | 216.9898679834695 |
+| Linear Regression | 7.360062854588416 |
+| Lasso (alpha=0.01) | 7.715332561743763 |
 | XGBoost + Hyperopt (best run) | 52.62305317090367 |
 
 ### Finding the best model
