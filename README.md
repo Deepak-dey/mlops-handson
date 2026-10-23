@@ -69,7 +69,7 @@ Applying AI to optimize system operations and infrastructure.
 |---|---|
 | Linear Regression | 7.360062854588416 |
 | Lasso (alpha=0.01) | 7.715332561743763 |
-| XGBoost + Hyperopt (best run) | 52.62305317090367 |
+| XGBoost + Hyperopt (best run) | 3.341255488245023 |
 
 ### Finding the best model
 
