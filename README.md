@@ -71,6 +71,9 @@ Applying AI to optimize system operations and infrastructure.
 | Lasso (alpha=0.01) | 7.715332561743763 |
 | XGBoost + Hyperopt (best run) | 3.341255488245023 |
 | RandomForest | 4.492519796951406 |
+| ExtraTrees| 8.160463358348522 |
+| GradientBoosting | 4.473238078277749 |
+| LinearSVR | 1199.114101329614 |
 
 
 ### Finding the best model
