@@ -46,8 +46,7 @@ def create_X(df,dv = None):
 
 def train_model(X_train, y_train, X_val, y_val, dv):
     with mlflow.start_run() as run:
-        mlflow.log_param("train_data_path", "data/yellow_tripdata_2021-01.parquet")
-        mlflow.log_param("valid_data_path", "data/yellow_tripdata_2021-02.parquet")
+        
         train = xgb.DMatrix(X_train, label=y_train)
         val = xgb.DMatrix(X_val, label=y_val)
 
