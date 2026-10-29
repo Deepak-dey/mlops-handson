@@ -39,6 +39,8 @@ Applying AI to optimize system operations and infrastructure.
 - **Machine Learning:** Scikit-Learn, XGBoost, PyTorch
 - **Hyperparameter Tuning:** Hyperopt
 - **Experiment Tracking & Model Management:** MLflow
+- **Serving:** Flask, Gunicorn
+- **Dependency Management:** Pipenv
 - **DevOps & Deployment:** Docker, GitHub Actions
 
 ## 📈 Current Progress Tracker
@@ -49,7 +51,9 @@ Applying AI to optimize system operations and infrastructure.
 - [x] Phase 1: XGBoost model with Hyperopt hyperparameter tuning
 - [x] Phase 1: Best model selected by lowest RMSE and managed in MLflow
 - [x] Phase 1: Training orchestrator script (parameterized by year and month)
-- [ ] Phase 1: Packaging model with Docker
+- [x] Phase 1: Flask prediction web service
+- [x] Phase 1: Packaging model with Docker
+- [ ] Phase 1: CI/CD with GitHub Actions
 - [ ] Phase 2: Core LLM pipeline implementation
 - [ ] Phase 3: Telemetry and log collection setup
 
@@ -187,11 +191,157 @@ mlflow.register_model(
 )
 ```
 
+## 🌐 Prediction Web Service (Flask + Docker)
+
+The model is served as a small REST API and packaged as a Docker image, so it runs the same way on a laptop, in CI, or in the cloud. The service lives in the `web-service/` folder and does not depend on MLflow at runtime.
+
+### Folder layout
+
+```
+web-service/
+├── predict.py        # Flask app with the /predict endpoint
+├── lin_reg.bin       # pickled (DictVectorizer, model) tuple
+├── Pipfile           # service dependencies
+├── Pipfile.lock      # exact pinned versions
+└── Dockerfile
+```
+
+### How the service works
+
+1. On startup it loads `lin_reg.bin`, which holds the fitted `DictVectorizer` and the trained model as a tuple.
+2. `POST /predict` receives a JSON ride, builds the `PU_DO` feature (`PULocationID_DOLocationID`) and passes `trip_distance` through.
+3. The preprocessor turns the features into a sparse matrix, the model predicts, and the API returns the predicted duration in minutes.
+
+### API
+
+**Endpoint:** `POST /predict` on port `9696`
+
+Request:
+
+```json
+{
+  "PULocationID": 43,
+  "DOLocationID": 151,
+  "trip_distance": 1.2
+}
+```
+
+Response:
+
+```json
+{
+  "duration": 9.87
+}
+```
+
+`duration` is the predicted trip time in minutes. The value above is only an illustration of the format.
+
+### Dependencies (Pipenv)
+
+The service needs only Flask, scikit-learn and gunicorn. MLflow is not required.
+
+```bash
+cd web-service
+pipenv --python 3.12
+pipenv install scikit-learn==<training version> flask gunicorn
+```
+
+Pin scikit-learn to the exact version used to create `lin_reg.bin`. Check it with `pip show scikit-learn` in the training environment. A pickle loaded under a different version can warn or break.
+
+This creates `Pipfile` and `Pipfile.lock`. Commit both. To refresh only the lock file, run `pipenv lock`.
+
+### Dockerfile
+
+```dockerfile
+FROM python:3.12-slim
+
+RUN pip install --no-cache-dir -U pip pipenv
+
+WORKDIR /app
+
+COPY ["Pipfile", "Pipfile.lock", "./"]
+RUN pipenv install --system --deploy
+
+COPY ["predict.py", "lin_reg.bin", "./"]
+
+EXPOSE 9696
+
+ENTRYPOINT ["gunicorn", "--bind=0.0.0.0:9696", "predict:app"]
+```
+
+Notes:
+
+- The Python version in `FROM` must match `python_version` in the Pipfile, otherwise `pipenv install --deploy` fails.
+- `--deploy` also fails if `Pipfile.lock` is out of date, so run `pipenv lock` after any dependency change.
+- The container uses **gunicorn** as the production server. Flask's built-in server (`app.run(debug=True)`) is only for local development.
+
+A `.dockerignore` keeps the build context small:
+
+```
+venv/
+.venv/
+mlruns/
+mlflow.db
+data/
+*.ipynb
+.git
+```
+
+### Build and run
+
+```bash
+cd web-service
+docker build -t duration-prediction:v1 .
+docker run -it --rm -p 9696:9696 duration-prediction:v1
+```
+
+On an Apple Silicon Mac, build with `--platform linux/amd64` if the image will run on an x86 server:
+
+```bash
+docker build --platform linux/amd64 -t duration-prediction:v1 .
+```
+
+### Test the service
+
+With the container running, from another terminal:
+
+```bash
+curl -X POST http://localhost:9696/predict \
+  -H "Content-Type: application/json" \
+  -d '{"PULocationID": 43, "DOLocationID": 151, "trip_distance": 1.2}'
+```
+
+Or from Python:
+
+```python
+import requests
+
+ride = {"PULocationID": 43, "DOLocationID": 151, "trip_distance": 1.2}
+print(requests.post("http://localhost:9696/predict", json=ride).json())
+```
+
+### Running without Docker (local development)
+
+```bash
+cd web-service
+pipenv install --ignore-pipfile      # install exactly what Pipfile.lock says
+pipenv run python predict.py         # Flask dev server on port 9696
+```
+
+### Troubleshooting
+
+| Problem | Fix |
+|---|---|
+| `docker: command not found` | Start Docker Desktop (`open -a Docker`) and make sure `/Applications/Docker.app/Contents/Resources/bin` is on your `PATH` |
+| `pipenv install --deploy` fails in the build | Check that the Python version matches the Pipfile and that `Pipfile.lock` is current (`pipenv lock`) |
+| Sklearn version warning or unpickling error | Pin scikit-learn to the version used to train the model |
+| Port 9696 already in use | Map another host port, for example `-p 9797:9696` |
+
 ## 🏃 How to Run the Current Iteration
 
 ### Prerequisites
 
-Python 3.10+ and `venv` installed.
+Python 3.10+, `venv`, and Docker (for the web service) installed.
 
 ### Setup
 
@@ -227,4 +377,11 @@ Python 3.10+ and `venv` installed.
    python src/mlops/orchestrator.py --year 2021 --month 1
    ```
 
-7. Open the MLflow UI and sort runs by `rmse` to see the best model.
+7. Build and run the prediction service:
+   ```bash
+   cd web-service
+   docker build -t duration-prediction:v1 .
+   docker run -it --rm -p 9696:9696 duration-prediction:v1
+   ```
+
+8. Open the MLflow UI and sort runs by `rmse` to see the best model, and send a test request to `http://localhost:9696/predict`.
