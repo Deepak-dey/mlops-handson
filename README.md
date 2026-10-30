@@ -51,7 +51,9 @@ Applying AI to optimize system operations and infrastructure.
 - [x] Phase 1: XGBoost model with Hyperopt hyperparameter tuning
 - [x] Phase 1: Best model selected by lowest RMSE and managed in MLflow
 - [x] Phase 1: Training orchestrator script (parameterized by year and month)
+- [x] Phase 1: Data preparation aligned with the serving features (`PU_DO` + `trip_distance`)
 - [x] Phase 1: Flask prediction web service
+- [x] Phase 1: API client test script
 - [x] Phase 1: Packaging model with Docker
 - [ ] Phase 1: CI/CD with GitHub Actions
 - [ ] Phase 2: Core LLM pipeline implementation
@@ -191,15 +193,89 @@ mlflow.register_model(
 )
 ```
 
+## 🧹 Data Preparation for the Served Model
+
+The web service loads a pickled `(DictVectorizer, model)` tuple. For predictions to be correct, **training and serving must use exactly the same features**: a `PU_DO` categorical (`"<pickup>_<dropoff>"`) and the numerical `trip_distance`.
+
+### Loading and cleaning the data
+
+The data is the NYC **yellow taxi** dataset, so every datetime column is `tpep_*` (green taxi data uses `lpep_*`). Mixing the two prefixes creates unused attributes instead of converting the real columns.
+
+```python
+import pandas as pd
+
+def read_dataframe(filename):
+    df = pd.read_parquet(filename)
+
+    df["tpep_pickup_datetime"] = pd.to_datetime(df["tpep_pickup_datetime"])
+    df["tpep_dropoff_datetime"] = pd.to_datetime(df["tpep_dropoff_datetime"])
+
+    df["duration"] = (df["tpep_dropoff_datetime"] - df["tpep_pickup_datetime"]).dt.total_seconds() / 60
+
+    df = df[(df["duration"] >= 1) & (df["duration"] <= 60)].copy()
+
+    categorical = ["PULocationID", "DOLocationID"]
+    df[categorical] = df[categorical].astype(str)
+
+    df["PU_DO"] = df["PULocationID"] + "_" + df["DOLocationID"]
+
+    return df
+```
+
+Key points:
+
+- Vectorized `.dt.total_seconds()` replaces the slow row-wise `apply`.
+- `.copy()` after filtering avoids `SettingWithCopyWarning`.
+- `PU_DO` is created here, once. Do not build it again in a later cell.
+
+### Building features
+
+```python
+from sklearn.feature_extraction import DictVectorizer
+
+train_df = read_dataframe("data/yellow_tripdata_2021-01.parquet")
+val_df = read_dataframe("data/yellow_tripdata_2021-02.parquet")
+
+categorical = ["PU_DO"]
+numerical = ["trip_distance"]
+target = "duration"
+
+dv = DictVectorizer()
+
+train_dicts = train_df[categorical + numerical].to_dict(orient="records")
+X_train = dv.fit_transform(train_dicts)      # fit on training data only
+Y_train = train_df[target].values
+
+val_dicts = val_df[categorical + numerical].to_dict(orient="records")
+X_val = dv.transform(val_dicts)              # transform only, never fit again
+Y_val = val_df[target].values
+```
+
+### Training and saving the model
+
+```python
+import pickle
+from sklearn.linear_model import LinearRegression
+
+lr = LinearRegression()
+lr.fit(X_train, Y_train)
+
+with open("lin_reg.bin", "wb") as f_out:
+    pickle.dump((dv, lr), f_out)
+```
+
+Copy `lin_reg.bin` into `deployment/web-service/`. Check that it is not empty (`ls -l lin_reg.bin`). Use the same scikit-learn version for training and serving.
+
 ## 🌐 Prediction Web Service (Flask + Docker)
 
-The model is served as a small REST API and packaged as a Docker image, so it runs the same way on a laptop, in CI, or in the cloud. The service lives in the `web-service/` folder and does not depend on MLflow at runtime.
+The model is served as a small REST API and packaged as a Docker image, so it runs the same way on a laptop, in CI, or in the cloud. The service lives in `deployment/web-service/` and does not depend on MLflow at runtime.
 
 ### Folder layout
 
 ```
-web-service/
+deployment/web-service/
 ├── predict.py        # Flask app with the /predict endpoint
+├── test.py           # client script that calls the API
 ├── lin_reg.bin       # pickled (DictVectorizer, model) tuple
 ├── Pipfile           # service dependencies
 ├── Pipfile.lock      # exact pinned versions
@@ -209,8 +285,51 @@ web-service/
 ### How the service works
 
 1. On startup it loads `lin_reg.bin`, which holds the fitted `DictVectorizer` and the trained model as a tuple.
-2. `POST /predict` receives a JSON ride, builds the `PU_DO` feature (`PULocationID_DOLocationID`) and passes `trip_distance` through.
+2. `POST /predict` receives a JSON ride and builds the `PU_DO` feature (`PULocationID_DOLocationID`), passing `trip_distance` through.
 3. The preprocessor turns the features into a sparse matrix, the model predicts, and the API returns the predicted duration in minutes.
+
+### `predict.py`
+
+```python
+import pickle
+from flask import Flask, request, jsonify
+
+with open("lin_reg.bin", "rb") as f_in:
+    (dv, model) = pickle.load(f_in)
+
+
+def prepare_features(ride):
+    features = {}
+    features["PU_DO"] = "%s_%s" % (ride["PULocationID"], ride["DOLocationID"])
+    features["trip_distance"] = ride["trip_distance"]
+    return features
+
+
+def predict(features):
+    X = dv.transform([features])
+    y_pred = model.predict(X)
+    return float(y_pred[0])
+
+
+app = Flask("duration-prediction")
+
+
+@app.route("/predict", methods=["POST"])
+def predict_endpoint():
+    ride = request.get_json()
+    features = prepare_features(ride)
+    pred = predict(features)
+    return jsonify({"duration": pred})
+
+
+if __name__ == "__main__":
+    app.run(debug=True, host="0.0.0.0", port=9696)
+```
+
+Two details that matter:
+
+- `prepare_features` runs **once**, in the endpoint. `predict` receives the already-prepared features. Calling `prepare_features` inside `predict` as well raises `KeyError: 'PULocationID'`, because the second call receives the prepared dict.
+- The prediction is converted with `float(...)` so the response is always JSON serializable.
 
 ### API
 
@@ -234,14 +353,41 @@ Response:
 }
 ```
 
-`duration` is the predicted trip time in minutes. The value above is only an illustration of the format.
+`duration` is the predicted trip time in minutes. The value above only illustrates the format.
+
+### Test script (`test.py`)
+
+```python
+import requests
+
+ride = {
+    "PULocationID": 43,
+    "DOLocationID": 151,
+    "trip_distance": 1.2,
+}
+
+uri = "http://localhost:9696/predict"
+
+response = requests.post(uri, json=ride)
+
+print(response.status_code)
+print(response.json())
+```
+
+Run it while the server is up:
+
+```bash
+python test.py
+```
+
+Use realistic rides when sanity-checking. A very long distance such as 40 miles is far outside typical trips, and a linear model can return an odd value for it.
 
 ### Dependencies (Pipenv)
 
 The service needs only Flask, scikit-learn and gunicorn. MLflow is not required.
 
 ```bash
-cd web-service
+cd deployment/web-service
 pipenv --python 3.12
 pipenv install scikit-learn==<training version> flask gunicorn
 ```
@@ -273,7 +419,7 @@ Notes:
 
 - The Python version in `FROM` must match `python_version` in the Pipfile, otherwise `pipenv install --deploy` fails.
 - `--deploy` also fails if `Pipfile.lock` is out of date, so run `pipenv lock` after any dependency change.
-- The container uses **gunicorn** as the production server. Flask's built-in server (`app.run(debug=True)`) is only for local development.
+- The container uses **gunicorn** as the production server. Flask's built-in server (`app.run(debug=True)`) is for local development only.
 
 A `.dockerignore` keeps the build context small:
 
@@ -290,7 +436,7 @@ data/
 ### Build and run
 
 ```bash
-cd web-service
+cd deployment/web-service
 docker build -t duration-prediction:v1 .
 docker run -it --rm -p 9696:9696 duration-prediction:v1
 ```
@@ -311,30 +457,29 @@ curl -X POST http://localhost:9696/predict \
   -d '{"PULocationID": 43, "DOLocationID": 151, "trip_distance": 1.2}'
 ```
 
-Or from Python:
-
-```python
-import requests
-
-ride = {"PULocationID": 43, "DOLocationID": 151, "trip_distance": 1.2}
-print(requests.post("http://localhost:9696/predict", json=ride).json())
-```
+Or run `python test.py`.
 
 ### Running without Docker (local development)
 
 ```bash
-cd web-service
+cd deployment/web-service
 pipenv install --ignore-pipfile      # install exactly what Pipfile.lock says
 pipenv run python predict.py         # Flask dev server on port 9696
 ```
 
+If you edit `predict.py`, stop the server with Ctrl+C and start it again so it runs the new code.
+
 ### Troubleshooting
 
-| Problem | Fix |
+| Problem | Cause and fix |
 |---|---|
+| `EOFError: Ran out of input` when starting `predict.py` | `lin_reg.bin` is empty (0 bytes). Check with `ls -l lin_reg.bin` and recreate it with `pickle.dump((dv, lr), f_out)` |
+| `KeyError: 'PULocationID'` (HTTP 500) | `prepare_features` is being applied twice. Call it only in the endpoint, and make `predict(features)` take the prepared features |
+| `KeyError: 'PU_DO'` during training | The DataFrame did not come from the new `read_dataframe`. Re-run the data loading cell |
+| Datetime columns not converted, pandas attribute warning | Mixed `lpep_` and `tpep_` prefixes. Use `tpep_` for yellow taxi data |
+| Sklearn version warning or unpickling error | Pin scikit-learn to the version used to train the model |
 | `docker: command not found` | Start Docker Desktop (`open -a Docker`) and make sure `/Applications/Docker.app/Contents/Resources/bin` is on your `PATH` |
 | `pipenv install --deploy` fails in the build | Check that the Python version matches the Pipfile and that `Pipfile.lock` is current (`pipenv lock`) |
-| Sklearn version warning or unpickling error | Pin scikit-learn to the version used to train the model |
 | Port 9696 already in use | Map another host port, for example `-p 9797:9696` |
 
 ## 🏃 How to Run the Current Iteration
@@ -379,9 +524,9 @@ Python 3.10+, `venv`, and Docker (for the web service) installed.
 
 7. Build and run the prediction service:
    ```bash
-   cd web-service
+   cd deployment/web-service
    docker build -t duration-prediction:v1 .
    docker run -it --rm -p 9696:9696 duration-prediction:v1
    ```
 
-8. Open the MLflow UI and sort runs by `rmse` to see the best model, and send a test request to `http://localhost:9696/predict`.
+8. Test the API with `python test.py`, and open the MLflow UI to sort runs by `rmse` and see the best model.
