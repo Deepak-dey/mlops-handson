@@ -1,7 +1,7 @@
 import pickle
 from flask import Flask, request, jsonify
 
-with open("/Users/deepak/mlops/mlops-handson/experiment/models/lin_reg.bin", "rb") as f_in:
+with open("lin_reg.bin", "rb") as f_in:
     (dv,model) = pickle.load(f_in)
 
 def prepare_features(ride):
@@ -12,8 +12,7 @@ def prepare_features(ride):
 
 
 def predict(ride):
-    features = prepare_features(ride)
-    X = dv.transform([features])
+    X = dv.transform([ride])
     y_pred = model.predict(X)
     return y_pred[0]
 
