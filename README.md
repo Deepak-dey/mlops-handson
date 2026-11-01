@@ -55,6 +55,8 @@ Applying AI to optimize system operations and infrastructure.
 - [x] Phase 1: Flask prediction web service
 - [x] Phase 1: API client test script
 - [x] Phase 1: Packaging model with Docker
+- [x] Phase 1: Random forest pipeline logged and registered in the MLflow Model Registry
+- [x] Phase 1: Web service that loads the model from MLflow by run ID
 - [ ] Phase 1: CI/CD with GitHub Actions
 - [ ] Phase 2: Core LLM pipeline implementation
 - [ ] Phase 3: Telemetry and log collection setup
@@ -482,6 +484,148 @@ If you edit `predict.py`, stop the server with Ctrl+C and start it again so it r
 | `pipenv install --deploy` fails in the build | Check that the Python version matches the Pipfile and that `Pipfile.lock` is current (`pipenv lock`) |
 | Port 9696 already in use | Map another host port, for example `-p 9797:9696` |
 
+## 🔗 Serving a Model Straight from MLflow
+
+The first service loaded a pickle file (`lin_reg.bin`). This version loads the model **directly from the MLflow tracking server by run ID**, so what is served is exactly what was logged and can be traced back to its run. Everything runs locally (no AWS or other cloud): MLflow uses a local SQLite database and local artifact storage.
+
+### Logging the model
+
+A scikit-learn pipeline bundles the `DictVectorizer` and the model, so the service does not need a separate preprocessor file. The pipeline is logged and registered in one step:
+
+```python
+import mlflow
+from sklearn.ensemble import RandomForestRegressor
+from sklearn.feature_extraction import DictVectorizer
+from sklearn.metrics import root_mean_squared_error
+from sklearn.pipeline import make_pipeline
+
+with mlflow.start_run():
+    params = dict(max_depth=20, n_estimators=100, min_samples_leaf=10, random_state=0)
+    mlflow.log_params(params)
+
+    pipeline = make_pipeline(
+        DictVectorizer(),
+        RandomForestRegressor(**params, n_jobs=-1),
+    )
+    pipeline.fit(dict_train, y_train)
+
+    y_pred = pipeline.predict(dict_val)
+    rmse = root_mean_squared_error(y_val, y_pred)
+    mlflow.log_metric("rmse", rmse)
+
+    mlflow.sklearn.log_model(
+        pipeline,
+        name="model-rf",
+        registered_model_name="nyc-taxi-duration-rf",
+        skops_trusted_types=["sklearn.tree._tree.Tree"],
+    )
+```
+
+Notes:
+
+- Recent MLflow versions save sklearn models in the safer `skops` format and refuse types they have not been told to trust. A random forest contains `sklearn.tree._tree.Tree`, so it is listed explicitly in `skops_trusted_types`. This is safe because the model was trained locally. Only trust the specific types you have reviewed.
+- `name=` replaces the deprecated `artifact_path=`.
+- For speed while experimenting, use fewer trees (for example `n_estimators=30`) or a subsample of the training data.
+
+### Starting MLflow
+
+```bash
+mlflow ui --backend-store-uri sqlite:///mlflow.db
+```
+
+- Start it from the folder that holds `mlflow.db`, or use an absolute path (`sqlite:////Users/<you>/.../mlflow.db`, four slashes).
+- Use **one MLflow version everywhere** (notebook, orchestrator, UI, service). A database upgraded by a newer MLflow cannot be opened by an older one and fails with `Can't locate revision identified by '...'`.
+- If port 5000 is taken (AirPlay uses it on macOS), add `--port 5001` and update the tracking URI in the scripts.
+
+### The service (`deployment/web-service-mlflow/predict.py`)
+
+```python
+import os
+import mlflow
+from flask import Flask, request, jsonify
+
+RUN_ID = os.getenv("RUN_ID")
+
+mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "http://127.0.0.1:5000"))
+
+logged_model = f"runs:/{RUN_ID}/model-rf"
+model = mlflow.sklearn.load_model(logged_model)   # DictVectorizer + RandomForest pipeline
+
+
+def prepare_features(ride):
+    features = {}
+    features["PU_DO"] = "%s_%s" % (ride["PULocationID"], ride["DOLocationID"])
+    features["trip_distance"] = ride["trip_distance"]
+    return features
+
+
+def predict(features):
+    preds = model.predict([features])    # list of dicts, like in training
+    return float(preds[0])
+
+
+app = Flask("duration-prediction")
+
+
+@app.route("/predict", methods=["POST"])
+def predict_endpoint():
+    ride = request.get_json()
+    features = prepare_features(ride)
+    pred = predict(features)
+    return jsonify({"duration": pred})
+
+
+if __name__ == "__main__":
+    app.run(debug=True, host="0.0.0.0", port=9696)
+```
+
+How it works:
+
+1. The MLflow tracking URI and the run ID come from environment variables, so the same code serves any run.
+2. `runs:/<RUN_ID>/model-rf` points at the artifact folder logged above. The folder name must match what was logged.
+3. The loaded pipeline takes a **list of dicts**, exactly like training, and does the vectorizing and prediction in one call.
+
+### Running it
+
+Copy the run ID from the MLflow UI, keep the MLflow server running, then:
+
+```bash
+cd deployment/web-service-mlflow
+RUN_ID=<run id> python predict.py
+```
+
+Test it from another terminal with `python test.py` or the `curl` command in the previous section.
+
+### Running it in Docker
+
+Inside a container, `127.0.0.1` is the container itself, not your computer. There are two options:
+
+1. **Talk to the local MLflow server.** Point the container at the host and pass the run ID:
+   ```bash
+   docker run -it --rm -p 9696:9696 \
+     -e RUN_ID=<run id> \
+     -e MLFLOW_TRACKING_URI=http://host.docker.internal:5000 \
+     duration-prediction:v1
+   ```
+   This only works if the artifacts are served through the MLflow server. Check with `mlflow.get_run(RUN_ID).info.artifact_uri`. If it is a plain local folder path, the container cannot read it unless that folder is mounted with `-v`.
+2. **Bake the model into the image (recommended without a cloud).** Download the model once before building, copy it into the image, and load it without MLflow at runtime:
+   ```python
+   mlflow.artifacts.download_artifacts(run_id=RUN_ID, artifact_path="model-rf", dst_path="model")
+   ```
+   The image is then self-contained and does not need the MLflow server or a database.
+
+### Troubleshooting (MLflow-backed service)
+
+| Problem | Cause and fix |
+|---|---|
+| `TypeError: set_tracking_uri() takes 1 positional argument but 2 were given` | `set_tracking_uri` takes only the URI. Use `mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "http://127.0.0.1:5000"))` |
+| `RESOURCE_DOES_NOT_EXIST: Run with id=None not found` | `RUN_ID` is not set. Start with `RUN_ID=<run id> python predict.py` |
+| `UntrustedTypesFoundException: sklearn.tree._tree.Tree` | Pass `skops_trusted_types=["sklearn.tree._tree.Tree"]` to `mlflow.sklearn.log_model` |
+| `Can't locate revision identified by '...'` when starting the UI | The database was upgraded by a newer MLflow. Start the UI with that same newer version, or upgrade MLflow in the active environment |
+| UI opens but runs are missing | The UI is reading a different `mlflow.db`. Start it from the right folder or use an absolute path |
+| Model path not found in the run | The artifact folder name in `logged_model` must match the logged `name` (for example `model-rf`); check the run's Artifacts tab |
+| Port 5000 already in use | Use `--port 5001` and update `MLFLOW_TRACKING_URI` |
+
 ## 🏃 How to Run the Current Iteration
 
 ### Prerequisites
@@ -529,4 +673,10 @@ Python 3.10+, `venv`, and Docker (for the web service) installed.
    docker run -it --rm -p 9696:9696 duration-prediction:v1
    ```
 
-8. Test the API with `python test.py`, and open the MLflow UI to sort runs by `rmse` and see the best model.
+8. Serve a model straight from MLflow (set `RUN_ID` to a run from the UI):
+   ```bash
+   cd deployment/web-service-mlflow
+   RUN_ID=<run id> python predict.py
+   ```
+
+9. Test the API with `python test.py`, and open the MLflow UI to sort runs by `rmse` and see the best model.
