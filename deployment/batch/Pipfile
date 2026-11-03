@@ -11,6 +11,7 @@ pyarrow = "*"
 prefect = "*"
 boto3 = "*"
 s3fs = "*"
+mlflow = "*"
 
 [dev-packages]
 
