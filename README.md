@@ -12,8 +12,9 @@ Building the foundational automation pipeline for traditional machine learning.
 
 - **Model Training:** Taxi trip duration regression with experiment tracking, hyperparameter tuning, and feature engineering.
 - **Experiment Tracking & Model Management:** MLflow for logging runs, comparing metrics, and managing the best model.
+- **Workflow Orchestration:** Prefect flows for scheduled batch scoring.
 - **CI/CD Pipelines:** Automated testing for data, code, and model artifacts.
-- **Deployment:** Containerized microservices using Docker and Kubernetes.
+- **Deployment:** Online serving with Flask and Docker, offline batch scoring with Prefect, and Kubernetes later.
 - **Monitoring:** Drift detection and automated model retraining triggers.
 
 ### 🤖 Phase 2: LLMOps (Upcoming)
@@ -37,8 +38,10 @@ Applying AI to optimize system operations and infrastructure.
 
 - **Language:** Python
 - **Machine Learning:** Scikit-Learn, XGBoost, PyTorch
+- **Data Handling:** Pandas, PyArrow
 - **Hyperparameter Tuning:** Hyperopt
 - **Experiment Tracking & Model Management:** MLflow
+- **Workflow Orchestration:** Prefect
 - **Serving:** Flask, Gunicorn
 - **Dependency Management:** Pipenv
 - **DevOps & Deployment:** Docker, GitHub Actions
@@ -57,6 +60,7 @@ Applying AI to optimize system operations and infrastructure.
 - [x] Phase 1: Packaging model with Docker
 - [x] Phase 1: Random forest pipeline logged and registered in the MLflow Model Registry
 - [x] Phase 1: Web service that loads the model from MLflow by run ID
+- [x] Phase 1: Local batch scoring flow with Prefect (monthly, model loaded from MLflow)
 - [ ] Phase 1: CI/CD with GitHub Actions
 - [ ] Phase 2: Core LLM pipeline implementation
 - [ ] Phase 3: Telemetry and log collection setup
@@ -626,6 +630,129 @@ Inside a container, `127.0.0.1` is the container itself, not your computer. Ther
 | Model path not found in the run | The artifact folder name in `logged_model` must match the logged `name` (for example `model-rf`); check the run's Artifacts tab |
 | Port 5000 already in use | Use `--port 5001` and update `MLFLOW_TRACKING_URI` |
 
+## 📦 Batch Scoring with Prefect (Local)
+
+The web services above answer one ride at a time. This pipeline scores a **whole month of trips** in one go, which is how predictions are produced for reporting and monitoring. It is a Prefect flow that runs entirely on your machine, with no AWS account: input files are cached in `./data`, the model comes from local MLflow, and results are written to `./output`.
+
+### What it does
+
+For a given run date, the flow:
+
+1. Works out the **previous month** (run date `2021-03-01` scores `2021-02` data).
+2. Downloads the public NYC TLC parquet file and caches it in `./data`. Re-runs reuse the cached file.
+3. Loads the model from local MLflow by run ID.
+4. Predicts the trip duration for every ride and writes a parquet file under `./output`.
+
+### Folder layout
+
+```
+deployment/batch/
+├── score_batch_local.py   # Prefect flow and helper functions
+├── data/                  # cached TLC input files (created on first run)
+└── output/                # prediction parquet files (created on first run)
+```
+
+### Pipeline structure
+
+| Function | Purpose |
+|---|---|
+| `fetch_input(url, local_path)` | Prefect task. Downloads the TLC file once, with 2 retries |
+| `read_dataframe(filename)` | Reads parquet, computes `duration`, filters 1 to 60 minutes, adds a UUID `ride_id` |
+| `prepare_dictionaries(df)` | Builds `PU_DO` and returns `PU_DO` + `trip_distance` as a list of dicts |
+| `load_model(run_id)` | Loads the model from MLflow by run ID |
+| `apply_model(...)` | Prefect task. Reads, predicts and saves results |
+| `get_paths(run_date, taxi_type, run_id)` | Previous-month logic, source URL, cache path and output path |
+| `ride_duration_prediction(...)` | The Prefect flow that ties it together |
+
+### Aligning the script with this repo's model
+
+The script was first written around the green taxi dataset and a generic `model` artifact name. This repo trains on **yellow taxi** data and logs the random forest pipeline as `model-rf`, so make three changes:
+
+| Where | Change |
+|---|---|
+| `read_dataframe`, `save_results` | Use `tpep_pickup_datetime` and `tpep_dropoff_datetime` instead of `lpep_*` |
+| `load_model` | Use `mlflow.sklearn.load_model(f"runs:/{run_id}/model-rf")`, the same loader as the web service |
+| Command line | Pass `yellow` as the taxi type |
+
+If the model is the XGBoost one from the orchestrator, that run has a separate `DictVectorizer` (`preprocessor/preprocessor.b`) and `models_mlflow`, so load both as shown in "Using the trained model" instead.
+
+### Usage
+
+```bash
+python deployment/batch/score_batch_local.py <taxi_type> <year> <month> <mlflow_run_id>
+```
+
+Example (scores February 2021, because the flow always processes the month before the run date):
+
+```bash
+python deployment/batch/score_batch_local.py yellow 2021 3 <mlflow_run_id>
+```
+
+Output is written to:
+
+```
+output/taxi_type=yellow/year=2021/month=02/<run_id>.parquet
+```
+
+The MLflow location is read from the `MLFLOW_TRACKING_URI` environment variable and defaults to `sqlite:///mlflow.db` in the folder you run from.
+
+### Output columns
+
+| Column | Description |
+|---|---|
+| `ride_id` | Generated UUID per ride |
+| `lpep_pickup_datetime` | Pickup time (`tpep_pickup_datetime` for yellow taxi) |
+| `PULocationID`, `DOLocationID` | Pickup and dropoff zones |
+| `actual_duration` | Actual trip duration in minutes |
+| `predicted_duration` | Model prediction in minutes |
+| `diff` | `actual_duration - predicted_duration` |
+| `model_version` | MLflow run ID used for the predictions |
+
+### Prefect UI (optional)
+
+The flow runs without any setup. To see runs in a dashboard, start the server and run the script from another terminal:
+
+```bash
+prefect server start
+```
+
+Then open http://127.0.0.1:4200.
+
+### Scheduling
+
+To score each month automatically, call the flow without a run date. It then uses the flow's expected start time:
+
+```python
+from score_batch_local import ride_duration_prediction
+
+ride_duration_prediction.serve(
+    name="monthly-scoring",
+    cron="0 6 1 * *",
+    parameters={"taxi_type": "yellow", "run_id": "<your_run_id>"},
+)
+```
+
+Free alternatives to a local process: Prefect Cloud's free tier, or a GitHub Actions cron job.
+
+### Moving to the cloud later
+
+Only three places change:
+
+- `get_paths`: swap local paths for `s3://` URIs. Cloudflare R2 and Backblaze B2 are S3-compatible.
+- `load_model`: point at your remote MLflow artifact store.
+- `save_results`: write to the remote path. `pandas` handles `s3://` once `s3fs` is installed.
+
+### Troubleshooting (batch scoring)
+
+| Problem | Cause and fix |
+|---|---|
+| `RESOURCE_DOES_NOT_EXIST` or run not found | Wrong `run_id`, or `MLFLOW_TRACKING_URI` does not match the backend used in training |
+| Model artifact not found | The artifact folder name in `load_model` must match what was logged (`model-rf`) |
+| 403 or 404 when downloading | That month may not be published yet. Try an earlier month |
+| `KeyError: 'lpep_pickup_datetime'` | Yellow taxi data uses `tpep_*` columns. See "Aligning the script" above |
+| Unpickling or version errors | Install the same `scikit-learn` version used for training |
+| Stale or partial input file | Delete the file in `./data` to force a fresh download |
+
 ## 🏃 How to Run the Current Iteration
 
 ### Prerequisites
@@ -679,4 +806,9 @@ Python 3.10+, `venv`, and Docker (for the web service) installed.
    RUN_ID=<run id> python predict.py
    ```
 
-9. Test the API with `python test.py`, and open the MLflow UI to sort runs by `rmse` and see the best model.
+9. Run batch scoring for a month with Prefect (after aligning the script, see the batch section):
+   ```bash
+   python deployment/batch/score_batch_local.py yellow 2021 3 <run id>
+   ```
+
+10. Test the API with `python test.py`, and open the MLflow UI to sort runs by `rmse` and see the best model.
