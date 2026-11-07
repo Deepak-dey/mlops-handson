@@ -812,5 +812,3 @@ Python 3.10+, `venv`, and Docker (for the web service) installed.
    ```
 
 10. Test the API with `python test.py`, and open the MLflow UI to sort runs by `rmse` and see the best model.
-
-
