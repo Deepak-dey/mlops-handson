@@ -224,5 +224,4 @@ venv/
 mlruns/
 mlflow.db
 data/
-*.ipynb
 .git
