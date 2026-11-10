@@ -15,7 +15,7 @@ Building the foundational automation pipeline for traditional machine learning.
 - **Workflow Orchestration:** Prefect flows for scheduled batch scoring.
 - **CI/CD Pipelines:** Automated testing for data, code, and model artifacts.
 - **Deployment:** Online serving with Flask and Docker, offline batch scoring with Prefect, and Kubernetes later.
-- **Monitoring:** Drift detection and automated model retraining triggers.
+- **Monitoring:** Evidently reports for prediction drift and data quality, with daily reports tracked in a local Evidently dashboard. Automated retraining triggers come next.
 
 ### 🤖 Phase 2: LLMOps (Upcoming)
 
@@ -42,6 +42,7 @@ Applying AI to optimize system operations and infrastructure.
 - **Hyperparameter Tuning:** Hyperopt
 - **Experiment Tracking & Model Management:** MLflow
 - **Workflow Orchestration:** Prefect
+- **Monitoring:** Evidently (pinned to 0.6.7)
 - **Serving:** Flask, Gunicorn
 - **Dependency Management:** Pipenv
 - **DevOps & Deployment:** Docker, GitHub Actions
@@ -61,6 +62,8 @@ Applying AI to optimize system operations and infrastructure.
 - [x] Phase 1: Random forest pipeline logged and registered in the MLflow Model Registry
 - [x] Phase 1: Web service that loads the model from MLflow by run ID
 - [x] Phase 1: Local batch scoring flow with Prefect (monthly, model loaded from MLflow)
+- [x] Phase 1: Evidently drift report (prediction drift, dataset drift, missing values) on a baseline model
+- [x] Phase 1: Evidently dashboard with daily data-quality reports in a local workspace
 - [ ] Phase 1: CI/CD with GitHub Actions
 - [ ] Phase 2: Core LLM pipeline implementation
 - [ ] Phase 3: Telemetry and log collection setup
