@@ -43,6 +43,7 @@ Applying AI to optimize system operations and infrastructure.
 - **Experiment Tracking & Model Management:** MLflow
 - **Workflow Orchestration:** Prefect
 - **Monitoring:** Evidently (pinned to 0.6.7)
+- **Monitoring Dashboards:** PostgreSQL, Adminer and Grafana via Docker Compose
 - **Serving:** Flask, Gunicorn
 - **Dependency Management:** Pipenv
 - **DevOps & Deployment:** Docker, GitHub Actions
@@ -64,6 +65,8 @@ Applying AI to optimize system operations and infrastructure.
 - [x] Phase 1: Local batch scoring flow with Prefect (monthly, model loaded from MLflow)
 - [x] Phase 1: Evidently drift report (prediction drift, dataset drift, missing values) on a baseline model
 - [x] Phase 1: Evidently dashboard with daily data-quality reports in a local workspace
+- [x] Phase 1: Docker Compose stack for monitoring (PostgreSQL, Adminer, Grafana)
+- [ ] Phase 1: Write Evidently metrics to PostgreSQL and build Grafana panels
 - [ ] Phase 1: CI/CD with GitHub Actions
 - [ ] Phase 2: Core LLM pipeline implementation
 - [ ] Phase 3: Telemetry and log collection setup
@@ -756,6 +759,423 @@ Only three places change:
 | Unpickling or version errors | Install the same `scikit-learn` version used for training |
 | Stale or partial input file | Delete the file in `./data` to force a fresh download |
 
+## 📊 Model Monitoring with Evidently
+
+Once a model is serving predictions, the question is whether the data it sees, and the predictions it makes, still look like what it was trained on. This section answers that with [Evidently](https://github.com/evidentlyai/evidently). A one-off **drift report** compares a reference dataset (training data) with a current dataset (validation data), and a local **workspace and dashboard** tracks daily data-quality reports over time.
+
+> **This track is a separate baseline, not the yellow-taxi random forest above.** It uses **green taxi** data (January 2022, `lpep_*` columns) and a `LinearRegression` model with six input columns. The monitoring steps are the same for any model: swap in the yellow-taxi data, the random forest and its features, and update the column mapping.
+
+### Pin Evidently to 0.6.7
+
+Evidently 0.7 replaced its API. On 0.7.x, `from evidently import ColumnMapping` fails with `ImportError: cannot import name 'ColumnMapping'`, and the code below only runs on the older API. Pin the version and restart the notebook kernel:
+
+```bash
+pip install "evidently==0.6.7"
+```
+
+Install into a clean environment (for example `conda create -n mlops python=3.12`) rather than Anaconda base. Do not pin `fsspec` or `cryptography` by hand; that caused version conflicts (see the troubleshooting table).
+
+### Folder layout
+
+```
+.
+├── data/         # downloaded TLC files and val_data.parquet
+├── models/       # lin_reg.bin
+└── workspace/    # Evidently workspace (created on first run)
+```
+
+Create `data/` and `models/` before running, because the download and the model save do not create them.
+
+### Step 1: Download the data
+
+```python
+import os, requests
+from tqdm import tqdm
+
+os.makedirs('./data', exist_ok=True)
+os.makedirs('./models', exist_ok=True)
+
+files = [('green_tripdata_2022-02.parquet', './data'), ('green_tripdata_2022-01.parquet', './data')]
+
+for file, path in files:
+    url = f'https://d37ci6vzurychx.cloudfront.net/trip-data/{file}'
+    resp = requests.get(url, stream=True)
+    save_path = f"{path}/{file}"
+    with open(save_path, 'wb') as f:
+        for data in tqdm(resp.iter_content(),
+                         desc=f"{file}",
+                         postfix=f"save to {save_path}",
+                         total=int(resp.headers["Content-Length"])):
+            f.write(data)
+```
+
+Only January is used below. February is the natural "next month" to monitor later.
+
+### Step 2: Prepare the data and train a baseline model
+
+```python
+import pandas as pd
+from sklearn.linear_model import LinearRegression
+
+jan_data = pd.read_parquet('./data/green_tripdata_2022-01.parquet')   # 62,495 rows, 20 columns
+
+# target: trip duration in minutes
+jan_data['duration_min'] = (jan_data.lpep_dropoff_datetime - jan_data.lpep_pickup_datetime).dt.total_seconds() / 60
+
+# filter outliers
+jan_data = jan_data[(jan_data.duration_min >= 0) & (jan_data.duration_min <= 60)]
+jan_data = jan_data[(jan_data.passenger_count > 0) & (jan_data.passenger_count <= 8)]   # 55,211 rows
+
+target = 'duration_min'
+num_features = ["passenger_count", "trip_distance", "fare_amount", "total_amount"]
+cat_features = ["PULocationID", "DOLocationID"]
+
+# first 30,000 rows = reference (training), the rest = current (validation)
+train_data = jan_data[:30000].copy()
+val_data = jan_data[30000:].copy()
+
+model = LinearRegression()
+model.fit(train_data[num_features + cat_features], train_data[target])
+```
+
+The `.copy()` calls avoid pandas `SettingWithCopyWarning` when the prediction columns are added next.
+
+### Step 3: Predict, evaluate and save
+
+Use **the same column name, `predictions`, in both datasets**. Evidently needs the prediction column to exist in the reference and the current data.
+
+```python
+from joblib import dump
+from sklearn.metrics import mean_absolute_error, mean_absolute_percentage_error
+
+train_data['predictions'] = model.predict(train_data[num_features + cat_features])
+val_data['predictions'] = model.predict(val_data[num_features + cat_features])
+
+print(f"Train MAE: {mean_absolute_error(train_data[target], train_data['predictions'])}")
+print(f"Val MAE:   {mean_absolute_error(val_data[target], val_data['predictions'])}")
+
+with open('models/lin_reg.bin', 'wb') as f_out:
+    dump(model, f_out)
+
+val_data.to_parquet('data/val_data.parquet', index=False)
+```
+
+| Metric | Train | Validation |
+|---|---|---|
+| MAE (minutes) | 3.80 | 4.14 |
+
+MAPE came out around 8e13 to 9e13 in the notebook, which is meaningless. It is most likely caused by trips with a duration of 0 minutes, which the `>= 0` filter keeps and MAPE divides by. Rely on MAE, or filter with `>= 1` to use MAPE.
+
+### Step 4: Drift report
+
+The report compares the training data (reference) with the validation data (current).
+
+```python
+from evidently import ColumnMapping
+from evidently.report import Report
+from evidently.metrics import ColumnDriftMetric, DatasetDriftMetric, DatasetMissingValuesMetric
+
+column_mapping = ColumnMapping(
+    target=None,
+    prediction='predictions',
+    numerical_features=num_features,
+    categorical_features=cat_features
+)
+
+report = Report(metrics=[
+    ColumnDriftMetric(column_name='predictions'),
+    DatasetDriftMetric(),
+    DatasetMissingValuesMetric()
+])
+
+report.run(reference_data=train_data, current_data=val_data, column_mapping=column_mapping)
+report            # renders the interactive report in the notebook
+```
+
+Define `column_mapping` and `report` before calling `report.run`, and run the cells in this order.
+
+Pull the numbers out for further processing (alerts, tests, logging):
+
+```python
+result = report.as_dict()
+
+result['metrics'][0]['result']['drift_score']                           # prediction drift
+result['metrics'][1]['result']['number_of_drifted_columns']             # drifted input columns
+result['metrics'][2]['result']['current']['share_of_missing_values']    # missing values in the current data
+```
+
+| Check | Result | Reading |
+|---|---|---|
+| Prediction drift (`predictions`) | 0.0305 (normed Wasserstein distance, threshold 0.1) | No drift detected |
+| Drifted columns | 0 | No input drift detected |
+| Share of missing values (current data) | 0.0455 | Equals exactly 1/22, which looks like one column that is entirely empty. Check with `val_data.isna().mean()` |
+
+### Step 5: Dashboard with daily data-quality reports
+
+An Evidently **workspace** is a folder that stores reports. A **project** inside it holds the reports and the dashboard panels.
+
+```python
+import datetime
+from evidently.metric_preset import DataDriftPreset, DataQualityPreset
+from evidently.ui.workspace import Workspace
+from evidently.ui.dashboards import DashboardPanelCounter, DashboardPanelPlot, CounterAgg, PanelValue, PlotType, ReportFilter
+from evidently.renderers.html_widgets import WidgetSize
+
+ws = Workspace("workspace")
+
+project = ws.create_project("NYC Taxi Data Quality Project")
+project.description = "Monitoring data quality for NYC taxi trip data"
+project.save()
+```
+
+Run `create_project` **once**. Running it again creates a second project with the same name.
+
+Add one report per day. This is a data-quality report on a single day of `val_data`, with no reference dataset, stamped with that day's date so the dashboard can plot it over time:
+
+```python
+regular_report = Report(
+    metrics=[DataQualityPreset()],
+    timestamp=datetime.datetime(2022, 1, 28)
+)
+
+regular_report.run(
+    reference_data=None,
+    current_data=val_data[val_data.lpep_pickup_datetime.between('2022-01-28', '2022-01-29', inclusive='left')],
+    column_mapping=column_mapping
+)
+
+ws.add_report(project.id, regular_report)
+```
+
+To add several days without copying the cell, loop over them. Pick days that exist in `val_data`; check with `val_data.lpep_pickup_datetime.min()` and `.max()`. The raw January file also contains a few pickups from 2009, so always filter by date range as above.
+
+```python
+for day in pd.date_range('2022-01-28', '2022-01-31'):
+    daily = val_data[val_data.lpep_pickup_datetime.between(day, day + pd.Timedelta(days=1), inclusive='left')]
+    if daily.empty:
+        continue
+    daily_report = Report(metrics=[DataQualityPreset()], timestamp=day.to_pydatetime())
+    daily_report.run(reference_data=None, current_data=daily, column_mapping=column_mapping)
+    ws.add_report(project.id, daily_report)
+```
+
+Configure the dashboard panels once (a title counter, inference count per day, and missing values per day):
+
+```python
+project.dashboard.add_panel(
+    DashboardPanelCounter(
+        filter=ReportFilter(metadata_values={}, tag_values=[]),
+        agg=CounterAgg.NONE,
+        title="NYC taxi data dashboard"
+    )
+)
+
+project.dashboard.add_panel(
+    DashboardPanelPlot(
+        filter=ReportFilter(metadata_values={}, tag_values=[]),
+        title="Inference Count",
+        values=[PanelValue(metric_id="DatasetSummaryMetric", field_path="current.number_of_rows", legend="count")],
+        plot_type=PlotType.BAR,
+        size=WidgetSize.HALF,
+    ),
+)
+
+project.dashboard.add_panel(
+    DashboardPanelPlot(
+        filter=ReportFilter(metadata_values={}, tag_values=[]),
+        title="Number of Missing Values",
+        values=[PanelValue(metric_id="DatasetSummaryMetric", field_path="current.number_of_missing_values", legend="count")],
+        plot_type=PlotType.LINE,
+        size=WidgetSize.HALF,
+    ),
+)
+
+project.save()
+```
+
+### Step 6: Open the dashboard
+
+From the folder that contains `workspace/`:
+
+```bash
+evidently ui --workspace ./workspace
+```
+
+Then open http://localhost:8000 (Evidently's default port), choose the project, and view the panels and the stored reports.
+
+### Troubleshooting (monitoring)
+
+| Problem | Cause and fix |
+|---|---|
+| `ImportError: cannot import name 'ColumnMapping' from 'evidently'` | Evidently 0.7+ has a new API. Run `pip install "evidently==0.6.7"` and restart the kernel. |
+| `ValueError: Prediction column (predictions) is partially present in data` | The reference and current data use different prediction column names. Use `predictions` in both. |
+| `KeyError: 'prediction'` in the evaluation cell | The evaluation reads `train_data['prediction']` (singular) while the prediction cell writes `predictions`. Use `predictions` everywhere. |
+| `pip` conflicts between `fsspec`, `cryptography`, `s3fs` or `pyopenssl` | Do not pin `fsspec` or `cryptography` by hand. Use a clean environment, run `pip install -U s3fs pyopenssl`, then `pip check`. |
+| `FutureWarning: 'H' is deprecated` when running `DataQualityPreset` | A pandas warning raised inside Evidently. It is harmless. |
+| Two projects with the same name in the UI | `create_project` was run twice. Run it once, or delete the `workspace/` folder to start over. |
+| MAPE is around 1e13 | Zero-minute trips are kept by the `>= 0` filter. Use MAE, or filter with `>= 1`. |
+| Dashboard panels are empty | No reports were added yet, or the reports have no `DatasetSummaryMetric`. Add reports built with `DataQualityPreset()`. |
+
+### Next steps
+
+- Run the same monitoring against the yellow-taxi random forest and its batch predictions.
+- Generate the daily report from the Prefect batch flow instead of by hand.
+- Trigger retraining when the drift score crosses its threshold.
+
+## 🐳 Monitoring Stack with Docker Compose (Postgres, Adminer, Grafana)
+
+The Evidently workspace is good for exploring reports. For dashboards that live next to other services, this stack stores monitoring metrics in **PostgreSQL** and plots them in **Grafana**, with **Adminer** as a small web UI for the database. Everything runs locally in Docker.
+
+```
+ notebook / batch job ──► PostgreSQL (db:5432) ◄── Grafana (localhost:3000)
+                              ▲
+                        Adminer (localhost:8080)
+```
+
+### Folder layout
+
+```
+monitoring/
+├── docker-compose.yml
+├── config/
+│   ├── grafana_datasources.yaml     # connects Grafana to Postgres
+│   └── grafana_dashboards.yaml      # tells Grafana where dashboard JSON files live
+└── dashboards/                      # dashboard JSON files (can start empty)
+```
+
+Create the mounted files **before** the first `up`. If they are missing, Docker creates folders in their place and Grafana fails to start.
+
+### `docker-compose.yml`
+
+```yaml
+volumes:
+  grafana_data: {}
+
+networks:
+  front-tier:
+  back-tier:
+
+services:
+  db:
+    image: postgres
+    restart: always
+    environment:
+      POSTGRES_PASSWORD: example
+    ports:
+      - "5432:5432"
+    networks:
+      - back-tier
+
+  adminer:
+    image: adminer
+    restart: always
+    ports:
+      - "8080:8080"
+    networks:
+      - back-tier
+      - front-tier
+
+  grafana:
+    image: grafana/grafana-enterprise
+    user: "472"
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./config/grafana_datasources.yaml:/etc/grafana/provisioning/datasources/datasource.yaml:ro
+      - ./config/grafana_dashboards.yaml:/etc/grafana/provisioning/dashboards/dashboards.yaml:ro
+      - ./dashboards:/opt/grafana/dashboards
+    networks:
+      - back-tier
+      - front-tier
+    restart: always
+```
+
+The `version:` line is left out because Compose v2 ignores it and prints a warning. `example` is a throwaway local password; change it for anything shared. Note that `db` has no volume, so its data is lost when the container is removed. To keep it, add `- postgres_data:/var/lib/postgresql/data` under `db` and declare `postgres_data: {}` under `volumes`.
+
+### `config/grafana_datasources.yaml`
+
+```yaml
+apiVersion: 1
+datasources:
+  - name: PostgreSQL
+    type: postgres
+    access: proxy
+    url: db:5432
+    database: test
+    user: postgres
+    secureJsonData:
+      password: 'example'
+    jsonData:
+      sslmode: 'disable'
+```
+
+The host is `db`, the service name on the Docker network, not `localhost`.
+
+### `config/grafana_dashboards.yaml`
+
+```yaml
+apiVersion: 1
+providers:
+  - name: 'Dashboards'
+    orgId: 1
+    folder: ''
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 10
+    allowUiUpdates: true
+    options:
+      path: /opt/grafana/dashboards
+      foldersFromFilesStructure: true
+```
+
+### Start it
+
+```bash
+cd monitoring
+mkdir -p config dashboards        # then create the two YAML files above
+docker compose up -d
+docker compose ps                 # db, adminer and grafana should be running
+docker compose logs grafana --tail 30
+```
+
+The first run pulls the images, so it takes a few minutes. Nothing is built, because all three services use ready-made images.
+
+### Create the `test` database
+
+The Grafana datasource points at a database named `test`, which does not exist yet.
+
+1. Open http://localhost:8080 (Adminer).
+2. Log in with System **PostgreSQL**, Server `db`, Username `postgres`, Password `example`, Database empty.
+3. Click **Create database**, name it `test`, and save.
+
+### Check Grafana
+
+1. Open http://localhost:3000 and log in with `admin` / `admin` (you can skip the password change).
+2. Go to Connections, then Data sources, then PostgreSQL, and click **Save & test**. It should report that the connection works.
+
+### Stop it
+
+```bash
+docker compose down        # stop and remove containers (Postgres data is lost without a volume)
+docker compose down -v     # also remove named volumes
+```
+
+### Troubleshooting (Docker Compose)
+
+| Problem | Cause and fix |
+|---|---|
+| `docker: command not found` on macOS | Docker Desktop is installed but its CLI is not on your `PATH`. Add it: `export PATH="$PATH:/Applications/Docker.app/Contents/Resources/bin"`, and put the same line in `~/.bash_profile` (or `~/.zshrc`) to keep it |
+| `Cannot connect to the Docker daemon` | Docker Desktop is not running. Start it with `open -a Docker` and wait for the whale icon to settle |
+| Grafana fails to start or the mounts show as folders | The files under `config/` did not exist when you ran `up`. Create them, run `docker compose down`, delete any folders Docker created in their place, then `up -d` again |
+| Grafana permission errors on `dashboards/` (Linux) | Run `chmod -R a+rX config dashboards` |
+| Grafana "Save & test" fails | The `test` database does not exist yet, or the password differs from `POSTGRES_PASSWORD` |
+| Port 3000, 5432 or 8080 already in use | Change the left side of the port mapping, for example `"3001:3000"` |
+| Warning that `version` is obsolete | Delete the `version:` line |
+
+### Next step: feed it with metrics
+
+The stack is empty until something writes to it. The next step is to insert the Evidently results (drift score, number of drifted columns, share of missing values) into a Postgres table once per day or per batch run, using `localhost:5432`, user `postgres`, password `example`, database `test`. Grafana panels then query that table.
+
 ## 🏃 How to Run the Current Iteration
 
 ### Prerequisites
@@ -815,3 +1235,16 @@ Python 3.10+, `venv`, and Docker (for the web service) installed.
    ```
 
 10. Test the API with `python test.py`, and open the MLflow UI to sort runs by `rmse` and see the best model.
+
+11. Run the monitoring notebook (it needs Evidently 0.6.7) and open the dashboard:
+    ```bash
+    pip install "evidently==0.6.7"
+    evidently ui --workspace ./workspace
+    ```
+
+12. Start the Postgres and Grafana monitoring stack (see the Docker Compose section for the config files):
+    ```bash
+    cd monitoring
+    docker compose up -d
+    ```
+    Adminer is on http://localhost:8080 and Grafana on http://localhost:3000.
