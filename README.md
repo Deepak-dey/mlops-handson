@@ -66,7 +66,8 @@ Applying AI to optimize system operations and infrastructure.
 - [x] Phase 1: Evidently drift report (prediction drift, dataset drift, missing values) on a baseline model
 - [x] Phase 1: Evidently dashboard with daily data-quality reports in a local workspace
 - [x] Phase 1: Docker Compose stack for monitoring (PostgreSQL, Adminer, Grafana)
-- [ ] Phase 1: Write Evidently metrics to PostgreSQL and build Grafana panels
+- [x] Phase 1: Prefect flow that writes daily Evidently metrics (prediction drift, drifted columns, missing values) to PostgreSQL
+- [ ] Phase 1: Build Grafana dashboard panels on the metrics table
 - [ ] Phase 1: CI/CD with GitHub Actions
 - [ ] Phase 2: Core LLM pipeline implementation
 - [ ] Phase 3: Telemetry and log collection setup
@@ -1174,7 +1175,201 @@ docker compose down -v     # also remove named volumes
 
 ### Next step: feed it with metrics
 
-The stack is empty until something writes to it. The next step is to insert the Evidently results (drift score, number of drifted columns, share of missing values) into a Postgres table once per day or per batch run, using `localhost:5432`, user `postgres`, password `example`, database `test`. Grafana panels then query that table.
+The stack is empty until something writes to it. The next section shows a Prefect flow that inserts the Evidently results (drift score, number of drifted columns, share of missing values) into a Postgres table, using `localhost:5432`, user `postgres`, password `example`, database `test`. Grafana panels then query that table.
+
+## 🔄 Writing Evidently Metrics to PostgreSQL (Prefect Backfill)
+
+This connects the two previous sections. A Prefect flow replays February 2022 green taxi data one day at a time, scores each day with the baseline model, runs an Evidently report against the reference data, and inserts the results into PostgreSQL in the Docker Compose stack. Grafana can then plot the table.
+
+```
+ data/reference.parquet ─┐
+ models/lin_reg.bin ─────┼─► Prefect flow ─► Evidently report (per day) ─► PostgreSQL: drift_metrics
+ green_tripdata_2022-02 ─┘
+```
+
+### Prerequisites
+
+- The Compose stack is running (`docker compose ps` shows `db` as `Up`). The script creates the `test` database itself, so the manual step in Adminer is optional.
+- Python packages: `pip install "evidently==0.6.7" prefect "psycopg[binary]" joblib pandas pyarrow`
+- `data/green_tripdata_2022-02.parquet` and `models/lin_reg.bin` from the Evidently section.
+- `data/reference.parquet`: the training data **including the `predictions` column**. Save it from the notebook once:
+
+```python
+train_data.to_parquet('data/reference.parquet', index=False)
+```
+
+### What the flow stores
+
+One row per day in the table `drift_metrics` (database `test`):
+
+| Column | Meaning |
+|---|---|
+| `timestamp` | The day being monitored |
+| `prediction_drift` | Drift score of the `predictions` column (normed Wasserstein, threshold 0.1) |
+| `num_drifted_columns` | Number of drifted input columns |
+| `share_missing_values` | Share of missing values in that day's data |
+
+### `evidently_metrics_calculation.py`
+
+```python
+import datetime
+import time
+import logging
+
+import joblib
+import numpy as np
+import pandas as pd
+import psycopg
+from prefect import task, flow
+from prefect.cache_policies import NO_CACHE
+
+from evidently import ColumnMapping
+from evidently.report import Report
+from evidently.metrics import ColumnDriftMetric, DatasetDriftMetric, DatasetMissingValuesMetric
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s]: %(message)s")
+
+SEND_TIMEOUT = 10   # seconds between days, to mimic a live feed
+
+create_table_statement = """
+drop table if exists drift_metrics;
+create table drift_metrics(
+    timestamp timestamp,
+    prediction_drift float,
+    num_drifted_columns integer,
+    share_missing_values float
+)
+"""
+
+num_features = ["passenger_count", "trip_distance", "fare_amount", "total_amount"]
+cat_features = ["PULocationID", "DOLocationID"]
+features = num_features + cat_features
+
+reference_data = pd.read_parquet("data/reference.parquet")
+model = joblib.load("models/lin_reg.bin")
+raw_data = pd.read_parquet("data/green_tripdata_2022-02.parquet")
+begin = datetime.datetime(2022, 2, 1, 0, 0)
+
+# the same prediction column name ("predictions") must exist in reference and current data
+column_mapping = ColumnMapping(
+    prediction="predictions",
+    numerical_features=num_features,
+    categorical_features=cat_features,
+    target=None,
+)
+
+
+def clean(df):
+    # inf or extreme values break the linear model; treat them as missing, then fill with 0
+    return df[features].replace([np.inf, -np.inf], np.nan).fillna(0)
+
+
+@task
+def prep_db():
+    with psycopg.connect("host=localhost port=5432 user=postgres password=example", autocommit=True) as conn:
+        res = conn.execute("SELECT 1 FROM pg_database WHERE datname='test'")
+        if len(res.fetchall()) == 0:
+            conn.execute("create database test;")
+    with psycopg.connect("host=localhost port=5432 dbname=test user=postgres password=example", autocommit=True) as conn:
+        conn.execute(create_table_statement)
+
+
+# NO_CACHE: Prefect cannot hash a database cursor, so skip input caching for this task
+@task(cache_policy=NO_CACHE)
+def calculate_metrics_postgresql(curr, i):
+    start = begin + datetime.timedelta(i)
+    end = begin + datetime.timedelta(i + 1)
+    current_data = raw_data[
+        (raw_data.lpep_pickup_datetime >= start) & (raw_data.lpep_pickup_datetime < end)
+    ].copy()
+
+    if current_data.empty:
+        logging.warning("no rows for %s, skipping", start.date())
+        return
+
+    current_data["predictions"] = model.predict(clean(current_data))
+
+    # a fresh report per day; reusing one Report object across runs is not safe
+    report = Report(metrics=[
+        ColumnDriftMetric(column_name="predictions"),
+        DatasetDriftMetric(),
+        DatasetMissingValuesMetric(),
+    ])
+    report.run(reference_data=reference_data, current_data=current_data, column_mapping=column_mapping)
+    result = report.as_dict()
+
+    prediction_drift = result["metrics"][0]["result"]["drift_score"]
+    num_drifted_columns = result["metrics"][1]["result"]["number_of_drifted_columns"]
+    share_missing_values = result["metrics"][2]["result"]["current"]["share_of_missing_values"]
+
+    curr.execute(
+        "insert into drift_metrics(timestamp, prediction_drift, num_drifted_columns, share_missing_values) "
+        "values (%s, %s, %s, %s)",
+        (start, prediction_drift, num_drifted_columns, share_missing_values),
+    )
+
+
+@flow
+def batch_monitoring_backfill():
+    prep_db()
+    with psycopg.connect("host=localhost port=5432 dbname=test user=postgres password=example", autocommit=True) as conn:
+        for i in range(0, 27):
+            with conn.cursor() as curr:
+                calculate_metrics_postgresql(curr, i)
+            time.sleep(SEND_TIMEOUT)
+            logging.info("data sent for day %s", i)
+
+
+if __name__ == "__main__":
+    batch_monitoring_backfill()
+```
+
+Key points:
+
+- **`prep_db` drops and recreates the table on every run.** That is fine for a backfill demo. Remove the `drop table` line before keeping real history.
+- **`autocommit=True`** on every connection, so each insert is visible immediately and Grafana can read rows while the flow is still running.
+- **`range(0, 27)`** covers 1 to 27 February. February has 28 days, so use `range(0, 28)` for the full month.
+- A full run takes about 4.5 minutes because of the 10 second pause per day. Set `SEND_TIMEOUT = 0` for a fast run.
+- Prefect starts a temporary local server for the run (it logs `Starting temporary server`). No setup is needed.
+
+### Run it
+
+```bash
+cd monitoring        # the folder with data/ and models/
+python evidently_metrics_calculation.py
+```
+
+Check the rows:
+
+```bash
+docker compose exec db psql -U postgres -d test -c "select * from drift_metrics order by timestamp;"
+```
+
+Or open Adminer (http://localhost:8080), choose database `test`, and open the `drift_metrics` table.
+
+### Query it in Grafana
+
+In Grafana, go to Explore, pick the PostgreSQL datasource, switch to Code mode and run:
+
+```sql
+SELECT timestamp AS time, prediction_drift, num_drifted_columns, share_missing_values
+FROM drift_metrics
+ORDER BY 1
+```
+
+Set the time range to **February 2022**, otherwise Grafana shows "No data" because the timestamps are in the past. A drift threshold line at 0.1 on the `prediction_drift` panel makes drifting days easy to spot.
+
+### Troubleshooting (metrics to Postgres)
+
+| Problem | Cause and fix |
+|---|---|
+| `connection refused` on port 5432 | The `db` container is not running. Run `docker compose up -d` in the folder with the compose file, then `docker compose exec db pg_isready -U postgres` |
+| `ValueError: Prediction column (...) is partially present in data` | Reference and current data use different prediction column names. `reference.parquet` and the code must both use `predictions` |
+| `HashError ... psycopg.Cursor` logged by Prefect | Prefect cannot hash the cursor argument. The task is still completed, but add `cache_policy=NO_CACHE` to silence it |
+| `RuntimeWarning: divide by zero / overflow ... in matmul` | Some rows contain inf or extreme values. The `clean()` helper above replaces inf with NaN and fills with 0. If it persists, inspect `raw_data[num_features].describe()` |
+| `InconsistentVersionWarning` for `LinearRegression` | The model was saved with a different scikit-learn version than the one loaded. Pin the version used for training |
+| Grafana shows "No data" | Widen the time range to February 2022 and check that the table has rows |
+| No rows for some days | `raw_data` has no trips on that date. The flow logs a warning and skips the day |
 
 ## 🏃 How to Run the Current Iteration
 
@@ -1248,3 +1443,8 @@ Python 3.10+, `venv`, and Docker (for the web service) installed.
     docker compose up -d
     ```
     Adminer is on http://localhost:8080 and Grafana on http://localhost:3000.
+
+13. Write the daily Evidently metrics to Postgres (needs the Compose stack from step 12, plus `data/reference.parquet` and `models/lin_reg.bin`):
+    ```bash
+    python evidently_metrics_calculation.py
+    ```
