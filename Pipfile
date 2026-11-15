@@ -4,6 +4,7 @@ verify_ssl = true
 name = "pypi"
 
 [packages]
+evidently = "==0.6.7"
 prefect = "*"
 tqdm = "*"
 requests = "*"
@@ -11,12 +12,12 @@ joblib = "*"
 pyarrow = "*"
 psycopg = "*"
 psycopg-binary = "*"
-evidently = "==0.6.7"
 pandas = "*"
 numpy = "*"
 scikit-learn = "*"
 jupyter = "*"
 matplotlib = "*"
+pytest = "*"
 
 [dev-packages]
 
