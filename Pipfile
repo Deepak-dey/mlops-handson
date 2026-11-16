@@ -18,6 +18,9 @@ scikit-learn = "*"
 jupyter = "*"
 matplotlib = "*"
 pytest = "*"
+fastapi = "*"
+uvicorn = {extras = ["standard"], version = "*"}
+confluent-kafka = "*"
 
 [dev-packages]
 
