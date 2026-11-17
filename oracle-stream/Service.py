@@ -38,7 +38,7 @@ BATCH_SIZE = int(os.getenv("BATCH_SIZE", "200"))
 STREAM = os.getenv("STREAM", "1") != "0"
 
 if not RUN_ID:
-    raise SyntaxError("set RUN_ID to the MLflow run that holds the model")
+    raise SystemExit("set RUN_ID to the MLflow run that holds the model")
 
 mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "http://127.0.0.1:5000"))
 
@@ -88,21 +88,21 @@ def stream_loop():
                 if m.error():
                     raise RuntimeError(f"Kafka error: {m.error()}")
                 try:
-                    ride = json.load(m.value())
+                    ride = json.loads(m.value())
                     feats.append(prepare_features(ride))
                     rides.append(ride)
                 except (ValueError, KeyError, TypeError) as exc:
                     log.warning("skipping malformed message: %s", exc)
             if rides:
                 for ride, pred in zip(rides,predict(feats)):
-                    producer.produce(OUT_TOPIC, key=str(ride.get("ride_id"," ")),value=json.dumps({"ride_id":ride.get("ride_is"),"duration":pred,"model_version":RUN_ID}))
-                    producer.flush(30)
-                    consumer.commit(asynchronous=False)
-                    stats["streamed"] += len(rides)
+                    producer.produce(OUT_TOPIC, key=str(ride.get("ride_id"," ")),value=json.dumps({"ride_id":ride.get("ride_id"),"duration":pred,"model_version":RUN_ID}))
+                producer.flush(30)
+                consumer.commit(asynchronous=False)
+                stats["streamed"] += len(rides)
     except Exception:
         log.exception("stream loop stopped")
     finally:
-        consumer.close
+        consumer.close()
 
 @asynccontextmanager
 async def lifespan(_app):
