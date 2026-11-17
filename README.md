@@ -14,7 +14,7 @@ Building the foundational automation pipeline for traditional machine learning.
 - **Experiment Tracking & Model Management:** MLflow for logging runs, comparing metrics, and managing the best model.
 - **Workflow Orchestration:** Prefect flows for scheduled batch scoring.
 - **CI/CD Pipelines:** Automated testing for data, code, and model artifacts.
-- **Deployment:** Online serving with Flask and Docker, offline batch scoring with Prefect, and Kubernetes later.
+- **Deployment:** Online serving with Flask and Docker, offline batch scoring with Prefect, streaming scoring with Kafka (Redpanda) and FastAPI, and Kubernetes later.
 - **Monitoring:** Evidently reports for prediction drift and data quality, with daily reports tracked in a local Evidently dashboard. Automated retraining triggers come next.
 
 ### 🤖 Phase 2: LLMOps (Upcoming)
@@ -44,7 +44,9 @@ Applying AI to optimize system operations and infrastructure.
 - **Workflow Orchestration:** Prefect
 - **Monitoring:** Evidently (pinned to 0.6.7)
 - **Monitoring Dashboards:** PostgreSQL, Adminer and Grafana via Docker Compose
-- **Serving:** Flask, Gunicorn
+- **Serving:** Flask, Gunicorn, FastAPI, Uvicorn
+- **Streaming:** Redpanda (Kafka API), confluent-kafka
+- **Testing:** pytest (fakes for MLflow, Kafka and Postgres), FastAPI TestClient
 - **Dependency Management:** Pipenv
 - **DevOps & Deployment:** Docker, GitHub Actions
 
@@ -67,6 +69,10 @@ Applying AI to optimize system operations and infrastructure.
 - [x] Phase 1: Evidently dashboard with daily data-quality reports in a local workspace
 - [x] Phase 1: Docker Compose stack for monitoring (PostgreSQL, Adminer, Grafana)
 - [x] Phase 1: Prefect flow that writes daily Evidently metrics (prediction drift, drifted columns, missing values) to PostgreSQL
+- [x] Phase 1: Streaming scorer `service.py`: FastAPI `/predict` plus a Kafka consumer/producer loop, model loaded from MLflow by run ID
+- [x] Phase 1: pytest suite for the streaming service (`conftest.py`, `test_service.py`, `test_service_http.py`) with fakes, no Kafka or MLflow needed
+- [ ] Phase 1: Dockerfile and Docker Compose for the streaming stack (Redpanda, service, producer)
+- [ ] Phase 1: Deploy the streaming stack to the Oracle Cloud free tier (written up, not deployed: no free Arm capacity yet)
 - [ ] Phase 1: Build Grafana dashboard panels on the metrics table
 - [ ] Phase 1: CI/CD with GitHub Actions
 - [ ] Phase 2: Core LLM pipeline implementation
@@ -1371,6 +1377,410 @@ Set the time range to **February 2022**, otherwise Grafana shows "No data" becau
 | Grafana shows "No data" | Widen the time range to February 2022 and check that the table has rows |
 | No rows for some days | `raw_data` has no trips on that date. The flow logs a warning and skips the day |
 
+## 🌊 Streaming Scoring with Kafka and FastAPI
+
+The Flask service answers one ride at a time and the Prefect flow scores a month at a time. This service scores rides **as they arrive**: a producer writes rides to a Kafka topic, the service predicts each one, and the predictions go to a second topic. The same process also keeps the `/predict` HTTP endpoint, now in FastAPI.
+
+```
+ producer ──► Redpanda topic `rides` ──► service.py (model from MLflow) ──► Redpanda topic `predictions`
+                                              │
+                                              └── POST /predict  (one ride in, one duration out)
+```
+
+Redpanda is used because it speaks the Kafka API with one small container, so the code is plain Kafka (`confluent-kafka`) and also runs against Apache Kafka.
+
+### Folder layout
+
+```
+deployment/streaming/
+├── service.py                 # FastAPI app + Kafka stream loop in one process
+├── pytest.ini
+├── requirements-dev.txt
+└── tests/
+    ├── conftest.py            # fake MLflow, fake Kafka, tiny model
+    ├── test_service.py        # features, batch scoring, stream loop
+    └── test_service_http.py   # FastAPI endpoints (needs fastapi + httpx)
+```
+
+Adjust the folder name to wherever you keep these files. The tests expect `service.py` one level above `tests/`.
+
+### How the service works
+
+1. On start-up it reads `RUN_ID`, loads the pipeline with `mlflow.sklearn.load_model("runs:/<RUN_ID>/<MODEL_ARTIFACT>")`, and exits with a clear message if `RUN_ID` is missing.
+2. `POST /predict` validates the ride with a Pydantic model (zone IDs are integers, `trip_distance` is not negative), builds the `PU_DO` feature and returns `{"duration": ...}`. Bad input gets a 422 from FastAPI instead of a crash.
+3. If `STREAM=1` (the default), a background thread starts with the app. It reads batches from the `rides` topic, predicts the whole batch in one call, and writes `{"ride_id", "duration", "model_version"}` to the `predictions` topic, keyed by `ride_id`.
+4. **Offsets are committed only after the predictions are flushed to Kafka.** A crash replays the batch (at-least-once) instead of losing it. Duplicates are possible after a crash.
+5. A malformed message is logged and skipped. A Kafka error or any other crash stops the stream, records the error in `/health` and still closes the consumer.
+6. `GET /health` shows the model version, whether the stream is running, how many rides it has scored, and the error if it stopped.
+
+### `service.py`
+
+```python
+"""FastAPI service: /predict endpoint plus the Kafka streaming scorer, in one process.
+
+    POST /predict   one ride in, one duration out
+    GET  /health    model version, whether the stream is running, how many rides it has scored
+    background      reads the `rides` topic, writes the `predictions` topic
+
+Run:
+    export RUN_ID=<mlflow run id>
+    export MLFLOW_TRACKING_URI=sqlite:////absolute/path/to/mlflow.db
+    uvicorn service:app --host 0.0.0.0 --port 9696
+Set STREAM=0 to run only the HTTP API (no Kafka needed).
+"""
+import json
+import logging
+import os
+import threading
+from contextlib import asynccontextmanager
+
+import mlflow
+import mlflow.sklearn
+from fastapi import FastAPI
+from pydantic import BaseModel, Field
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+log = logging.getLogger("duration-service")
+
+RUN_ID = os.getenv("RUN_ID")
+ARTIFACT = os.getenv("MODEL_ARTIFACT", "model")
+BOOTSTRAP = os.getenv("KAFKA_BOOTSTRAP", "localhost:9092")
+IN_TOPIC = os.getenv("IN_TOPIC", "rides")
+OUT_TOPIC = os.getenv("OUT_TOPIC", "predictions")
+BATCH_SIZE = int(os.getenv("BATCH_SIZE", "200"))
+STREAM = os.getenv("STREAM", "1") != "0"
+
+if not RUN_ID:
+    raise SystemExit("set RUN_ID to the MLflow run that holds the model")
+
+mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "http://127.0.0.1:5000"))
+model = mlflow.sklearn.load_model(f"runs:/{RUN_ID}/{ARTIFACT}")
+
+stats = {"streamed": 0, "error": None}
+stop_event = threading.Event()
+
+
+class Ride(BaseModel):
+    PULocationID: int
+    DOLocationID: int
+    trip_distance: float = Field(ge=0)
+
+
+def prepare_features(ride):
+    # Must match training. Ints keep 43.0 from becoming "43.0_151.0".
+    return {"PU_DO": "%s_%s" % (int(ride["PULocationID"]), int(ride["DOLocationID"])),
+            "trip_distance": float(ride["trip_distance"])}
+
+
+def predict(features_list):
+    return [float(p) for p in model.predict(features_list)]
+
+
+def score_batch(msgs, producer):
+    """Parse, predict and produce one batch. Returns (scored, skipped). Does not flush or commit."""
+    rides, feats, skipped = [], [], 0
+    for m in msgs:
+        if m.error():
+            raise RuntimeError(f"Kafka error: {m.error()}")
+        try:
+            ride = json.loads(m.value())
+            feats.append(prepare_features(ride))
+            rides.append(ride)
+        except (ValueError, KeyError, TypeError) as exc:
+            skipped += 1
+            log.warning("skipping malformed message: %s", exc)
+    if rides:
+        for ride, pred in zip(rides, predict(feats)):
+            producer.produce(OUT_TOPIC, key=str(ride.get("ride_id", "")),
+                             value=json.dumps({"ride_id": ride.get("ride_id"), "duration": pred,
+                                               "model_version": RUN_ID}))
+    return len(rides), skipped
+
+
+def stream_loop():
+    from confluent_kafka import Consumer, Producer
+
+    consumer = Consumer({"bootstrap.servers": BOOTSTRAP, "group.id": "duration-scorer",
+                         "auto.offset.reset": "earliest", "enable.auto.commit": False})
+    producer = Producer({"bootstrap.servers": BOOTSTRAP})
+    consumer.subscribe([IN_TOPIC])
+    log.info("streaming: consuming %s, producing %s", IN_TOPIC, OUT_TOPIC)
+    try:
+        while not stop_event.is_set():
+            msgs = consumer.consume(num_messages=BATCH_SIZE, timeout=1.0)
+            if not msgs:
+                continue
+            scored, _ = score_batch(msgs, producer)
+            producer.flush(30)                    # predictions are in Kafka ...
+            consumer.commit(asynchronous=False)   # ... before the input is marked as done
+            stats["streamed"] += scored
+    except Exception as exc:
+        stats["error"] = str(exc)
+        log.exception("stream loop stopped")
+    finally:
+        consumer.close()
+
+
+@asynccontextmanager
+async def lifespan(_app):
+    thread = None
+    if STREAM:
+        thread = threading.Thread(target=stream_loop, daemon=True)
+        thread.start()
+    yield
+    stop_event.set()
+    if thread:
+        thread.join(timeout=10)
+
+
+app = FastAPI(title="duration-prediction", lifespan=lifespan)
+
+
+@app.post("/predict")
+def predict_endpoint(ride: Ride):
+    return {"duration": predict([prepare_features(ride.model_dump())])[0]}
+
+
+@app.get("/health")
+def health():
+    return {"model_version": RUN_ID, "streaming": STREAM and stats["error"] is None,
+            "streamed": stats["streamed"], "error": stats["error"]}
+```
+
+### Configuration
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `RUN_ID` | required | MLflow run that holds the model |
+| `MLFLOW_TRACKING_URI` | `http://127.0.0.1:5000` | Tracking server or `sqlite:////absolute/path/mlflow.db` |
+| `MODEL_ARTIFACT` | `model` | Artifact folder in the run (`model-rf` for the random forest logged above) |
+| `KAFKA_BOOTSTRAP` | `localhost:9092` | Kafka or Redpanda address |
+| `IN_TOPIC`, `OUT_TOPIC` | `rides`, `predictions` | Topic names |
+| `BATCH_SIZE` | `200` | Messages read per batch |
+| `STREAM` | `1` | `0` runs only the HTTP API, with no Kafka needed |
+
+### Run the API alone first
+
+```bash
+pipenv install fastapi "uvicorn[standard]" confluent-kafka mlflow "scikit-learn==<training version>"
+export RUN_ID=<run id>
+export MODEL_ARTIFACT=model-rf        # the folder shown in the run's Artifacts tab
+export MLFLOW_TRACKING_URI=sqlite:////absolute/path/to/mlflow.db
+STREAM=0 pipenv run uvicorn service:app --host 0.0.0.0 --port 9696
+```
+
+```bash
+curl -X POST localhost:9696/predict -H 'Content-Type: application/json' \
+  -d '{"PULocationID": 43, "DOLocationID": 151, "trip_distance": 1.2}'
+```
+
+Interactive docs are at http://localhost:9696/docs.
+
+Use a **single** uvicorn worker. Each extra worker would start its own stream thread and duplicate the work.
+
+### Features must match training
+
+`prepare_features` builds `PU_DO` from `int(...)` values, so a zone ID that arrives as `43.0` still gives `43_151`. If your training code really produced `43.0_151.0` the model has never seen `43_151`, so check how `PU_DO` was built in training before trusting the predictions.
+
+### Tests
+
+The service loads its model when the module is imported, so the tests import a fresh copy of `service.py` for each test with a fake `mlflow` (returning a tiny DictVectorizer + RandomForest pipeline) and, when the stream runs, a fake `confluent_kafka`. Nothing touches the network.
+
+| File | What it proves |
+|---|---|
+| `test_service.py` | `RUN_ID` is required; `PU_DO` is built from ints; `score_batch` produces one message per good ride and keeps `ride_id` and `model_version`; malformed messages are skipped and counted; a Kafka error aborts the batch; the loop flushes and then commits once per batch; each ride is counted once; auto-commit is off; the consumer is closed on a clean stop and after a crash; nothing is committed when a batch fails |
+| `test_service_http.py` | `/predict` returns the model's answer; float zone IDs work; bad input returns 422; `/health` reports the state; the stream starts and stops with the app |
+
+The test file imports `fastapi.testclient` only in `test_service_http.py`, so the stream tests still run when FastAPI or `httpx` is missing.
+
+```bash
+pipenv install --dev -r requirements-dev.txt
+pipenv run pytest
+```
+
+**These tests caught real bugs.** Putting each original mistake back into `service.py` made a test fail: `json.load` instead of `json.loads` (an unhandled `AttributeError` that killed the stream thread silently), a typo in the `ride_id` key (every output had `ride_id: null`), `flush`/`commit` inside the per-message loop (one commit per ride and overcounted stats), `consumer.close` without `()`, and committing before flushing.
+
+`conftest.py` holds the shared fakes. `load_service(...)` imports a fresh `service.py` with the fakes installed, and `fake_kafka(...)` builds a fake `confluent_kafka` that hands out batches and stops the loop when they run out:
+
+```python
+"""Fixtures that load service.py without MLflow, Kafka or a network.
+
+service.py loads the model when it is imported, so each test imports a fresh copy with a fake `mlflow`
+(returning a tiny model) and, when the stream runs, a fake `confluent_kafka`.
+"""
+import importlib.util
+import json
+import sys
+import types
+from pathlib import Path
+
+import pytest
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+@pytest.fixture(scope="session")
+def tiny_model():
+    from sklearn.ensemble import RandomForestRegressor
+    from sklearn.feature_extraction import DictVectorizer
+    from sklearn.pipeline import make_pipeline
+
+    X = [{"PU_DO": "43_151", "trip_distance": 1.2}, {"PU_DO": "43_151", "trip_distance": 1.0},
+         {"PU_DO": "1_2", "trip_distance": 5.0}, {"PU_DO": "10_20", "trip_distance": 9.5}]
+    y = [9.0, 8.0, 20.0, 35.0]
+    return make_pipeline(DictVectorizer(), RandomForestRegressor(n_estimators=5, random_state=0)).fit(X, y)
+
+
+class FakeMessage:
+    def __init__(self, value=None, error=None):
+        self._value, self._error = value, error
+
+    def value(self):
+        return self._value
+
+    def error(self):
+        return self._error
+
+
+def ride_message(i=1, **overrides):
+    body = {"ride_id": f"r{i}", "PULocationID": 43, "DOLocationID": 151, "trip_distance": 1.2}
+    body.update(overrides)
+    return FakeMessage(json.dumps(body).encode())
+
+
+class FakeProducer:
+    def __init__(self, events):
+        self.events = events
+
+    def produce(self, topic, key=None, value=None, **_):
+        self.events.append(("produce", topic, key, json.loads(value)))
+
+    def flush(self, timeout=None):
+        self.events.append(("flush",))
+
+
+@pytest.fixture
+def events():
+    return []
+
+
+@pytest.fixture
+def producer(events):
+    return FakeProducer(events)
+
+
+@pytest.fixture
+def load_service(monkeypatch, tiny_model):
+    """load_service(env=..., kafka=...) -> a freshly imported service module."""
+    def _load(run_id="run-1", stream="0", kafka=None, extra_env=None):
+        monkeypatch.delenv("RUN_ID", raising=False)
+        if run_id is not None:
+            monkeypatch.setenv("RUN_ID", run_id)
+        monkeypatch.setenv("STREAM", stream)
+        for k, v in (extra_env or {}).items():
+            monkeypatch.setenv(k, v)
+
+        ml = types.ModuleType("mlflow")
+        ml.set_tracking_uri = lambda uri: None
+        sk = types.ModuleType("mlflow.sklearn")
+        sk.load_model = lambda uri: tiny_model
+        ml.sklearn = sk
+        monkeypatch.setitem(sys.modules, "mlflow", ml)
+        monkeypatch.setitem(sys.modules, "mlflow.sklearn", sk)
+        if kafka is not None:
+            monkeypatch.setitem(sys.modules, "confluent_kafka", kafka)
+
+        spec = importlib.util.spec_from_file_location("service_under_test", ROOT / "service.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    return _load
+
+
+def fake_kafka(events, batches, on_empty=None, boom=None):
+    """A fake confluent_kafka module. `batches` are lists of messages handed out one per consume() call."""
+    queue = list(batches)
+    state = {"closed": False}
+
+    class Consumer:
+        def __init__(self, conf):
+            self.conf = conf
+            state["conf"] = conf
+
+        def subscribe(self, topics):
+            events.append(("subscribe", topics))
+
+        def consume(self, num_messages, timeout):
+            if boom:
+                raise boom
+            if queue:
+                return queue.pop(0)
+            if on_empty:
+                on_empty()
+            return []
+
+        def commit(self, asynchronous=True):
+            events.append(("commit", asynchronous))
+
+        def close(self):
+            state["closed"] = True
+            events.append(("close",))
+
+    class Producer:
+        def __init__(self, conf):
+            self._p = FakeProducer(events)
+
+        def produce(self, *a, **kw):
+            self._p.produce(*a, **kw)
+
+        def flush(self, timeout=None):
+            self._p.flush(timeout)
+
+    module = types.ModuleType("confluent_kafka")
+    module.Consumer, module.Producer = Consumer, Producer
+    module.state = state
+    return module
+```
+
+### What is verified and what is not
+
+| Part | Status |
+|---|---|
+| Features, batch scoring and the stream loop | Covered by `test_service.py` against fakes |
+| FastAPI endpoints and the app lifecycle | Written in `test_service_http.py`; run it with FastAPI and `httpx` installed |
+| Real Kafka or Redpanda, a real MLflow model load, the Docker image | Not tested yet. This is the next step |
+
+### Streaming stack for Oracle Cloud (Always Free)
+
+A separate project folder, `oracle-stream/`, holds a production-style version of the same idea for a small cloud VM: Redpanda, Postgres, Grafana, a scorer that writes per-minute metrics to Postgres, and a Docker Compose file. It is documented in a step-by-step guide and has its own pytest suite. Its differences from `service.py`:
+
+- The model is exported once from MLflow (`export_model.py`) into a joblib file with a checksum and is downloaded from **OCI Object Storage** by the VM's own identity, so the container does not need MLflow or a database.
+- A pinned scikit-learn version is enforced at build time and checked at load time.
+- Metrics are stored as per-minute sums in Postgres, so repeated upserts stay correct.
+
+**Status:** written and unit-tested, not deployed. Oracle's free Arm shape (`VM.Standard.A1.Flex`) had no capacity in the home region, and the small x86 `VM.Standard.E2.1.Micro` (1 GB RAM) is too small for Redpanda, Postgres, Grafana and the scorer together. The stack runs on the laptop with Docker Compose in the meantime.
+
+### Next steps
+
+1. Dockerfile for `service.py`. The container needs the model without the MLflow server, so export it once (`mlflow.artifacts.download_artifacts(...)` or `export_model.py`) and load it from a file.
+2. Docker Compose with Redpanda, a one-shot topic creation job, the service and a producer that replays NYC TLC rides.
+3. Per-minute metrics in Postgres and Grafana panels (reuse the monitoring stack above).
+4. CI with GitHub Actions: run the pytest suite and build the image on every push.
+
+### Troubleshooting (streaming service)
+
+| Problem | Cause and fix |
+|---|---|
+| `SystemExit: set RUN_ID ...` on start | `RUN_ID` is not set. Export it in the same shell |
+| `RESOURCE_DOES_NOT_EXIST` or the model path is not found | `MODEL_ARTIFACT` does not match the folder in the run's Artifacts tab (`model` vs `model-rf`) |
+| The API works but `/health` shows `streaming: false` and an `error` | The stream thread crashed. Read the traceback in the log; the usual cause is Kafka not reachable at `KAFKA_BOOTSTRAP` |
+| `/health` shows `streamed` stuck at 0 | No messages arrive on `rides`, or the consumer group `duration-scorer` already read them (it commits offsets). Use a new group name, or reset the group offsets |
+| Every prediction looks wrong, but nothing errors | The `PU_DO` feature does not match training (`43_151` vs `43.0_151.0`) |
+| Duplicate predictions after a restart | Expected after a crash between flush and commit (at-least-once). Downstream consumers should de-duplicate on `ride_id` |
+| Stream runs twice | uvicorn was started with more than one worker. Use one |
+| `ModuleNotFoundError: confluent_kafka` | `pipenv install confluent-kafka`. It is imported only when the stream starts, so `STREAM=0` runs without it |
+
 ## 🏃 How to Run the Current Iteration
 
 ### Prerequisites
@@ -1447,4 +1857,19 @@ Python 3.10+, `venv`, and Docker (for the web service) installed.
 13. Write the daily Evidently metrics to Postgres (needs the Compose stack from step 12, plus `data/reference.parquet` and `models/lin_reg.bin`):
     ```bash
     python evidently_metrics_calculation.py
+    ```
+
+14. Run the streaming service API on its own (set `RUN_ID` and `MODEL_ARTIFACT` from the MLflow UI), then call it:
+    ```bash
+    cd deployment/streaming
+    STREAM=0 uvicorn service:app --port 9696
+    curl -X POST localhost:9696/predict -H 'Content-Type: application/json' \
+      -d '{"PULocationID": 43, "DOLocationID": 151, "trip_distance": 1.2}'
+    ```
+
+15. Run the streaming service tests (no Kafka or MLflow needed):
+    ```bash
+    cd deployment/streaming
+    pipenv install --dev -r requirements-dev.txt
+    pipenv run pytest
     ```
