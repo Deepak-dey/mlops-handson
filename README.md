@@ -71,6 +71,7 @@ Applying AI to optimize system operations and infrastructure.
 - [x] Phase 1: Prefect flow that writes daily Evidently metrics (prediction drift, drifted columns, missing values) to PostgreSQL
 - [x] Phase 1: Streaming scorer `service.py`: FastAPI `/predict` plus a Kafka consumer/producer loop, model loaded from MLflow by run ID
 - [x] Phase 1: pytest suite for the streaming service (`conftest.py`, `test_service.py`, `test_service_http.py`) with fakes, no Kafka or MLflow needed
+- [x] Phase 1: First pytest run on the Mac: fixed test typos (`422`, `TestClient`), three `conftest.py` bugs (`produce`, `closed`, `service.py` file-name case) and made `/health` report a crashed stream
 - [ ] Phase 1: Dockerfile and Docker Compose for the streaming stack (Redpanda, service, producer)
 - [ ] Phase 1: Deploy the streaming stack to the Oracle Cloud free tier (written up, not deployed: no free Arm capacity yet)
 - [ ] Phase 1: Build Grafana dashboard panels on the metrics table
@@ -1392,7 +1393,7 @@ Redpanda is used because it speaks the Kafka API with one small container, so th
 ### Folder layout
 
 ```
-deployment/streaming/
+oracle-stream/
 ├── service.py                 # FastAPI app + Kafka stream loop in one process
 ├── pytest.ini
 ├── requirements-dev.txt
@@ -1402,7 +1403,9 @@ deployment/streaming/
     └── test_service_http.py   # FastAPI endpoints (needs fastapi + httpx)
 ```
 
-Adjust the folder name to wherever you keep these files. The tests expect `service.py` one level above `tests/`.
+The tests expect `service.py` one level above `tests/`. Run `pytest` from this folder (`oracle-stream/`), which is also the pytest root.
+
+The file must be named `service.py` in lower case. macOS ignores case, so `Service.py` works on a Mac but fails on Linux and in CI. A case-only rename needs two `git mv` steps (see the troubleshooting table).
 
 ### How the service works
 
@@ -1594,9 +1597,24 @@ The service loads its model when the module is imported, so the tests import a f
 The test file imports `fastapi.testclient` only in `test_service_http.py`, so the stream tests still run when FastAPI or `httpx` is missing.
 
 ```bash
+cd oracle-stream
 pipenv install --dev -r requirements-dev.txt
-pipenv run pytest
+pipenv run pytest -v          # the whole suite, not one file
 ```
+
+Inside an already activated virtualenv, use plain `pytest -v`. Calling `pipenv run` there prints a harmless "Pipenv found itself running within a virtual environment" notice; `deactivate` first, or set `PIPENV_VERBOSITY=-1` to silence it.
+
+Typical first-run failures and their causes:
+
+| Failure | Cause and fix |
+|---|---|
+| `assert 422 == 442` | Typo in the expected status code. FastAPI returns 422 for invalid input |
+| `AttributeError: ... no attribute 'TestCLient'` | Typo. It is `fastapi.testclient.TestClient` |
+| `test_health_without_stream` expects `"error": None` | `service.py` must keep `stats = {"streamed": 0, "error": None}`, set `stats["error"]` when the loop crashes, and return it from `/health` |
+| `assert False is True` on `kafka.state["closed"]` | The fake consumer set `state["close"]`. The key must be `closed` |
+| `AttributeError` on `producer.produce` | The fake producer method was named `producer`. It must be `produce`, and log `("produce", ...)` |
+| Fails on Linux or CI but passes on the Mac | `conftest.py` loads `Service.py` instead of `service.py` |
+| Only the HTTP file ran | A single file was passed to `pytest`. Run `pytest -v` for all files |
 
 **These tests caught real bugs.** Putting each original mistake back into `service.py` made a test fail: `json.load` instead of `json.loads` (an unhandled `AttributeError` that killed the stream thread silently), a typo in the `ride_id` key (every output had `ride_id: null`), `flush`/`commit` inside the per-message loop (one commit per ride and overcounted stats), `consumer.close` without `()`, and committing before flushing.
 
@@ -1748,7 +1766,7 @@ def fake_kafka(events, batches, on_empty=None, boom=None):
 | Part | Status |
 |---|---|
 | Features, batch scoring and the stream loop | Covered by `test_service.py` against fakes |
-| FastAPI endpoints and the app lifecycle | Written in `test_service_http.py`; run it with FastAPI and `httpx` installed |
+| FastAPI endpoints and the app lifecycle | `test_service_http.py` ran on the Mac. Its failures were typos in the tests and the fake Kafka in `conftest.py`, not in the service |
 | Real Kafka or Redpanda, a real MLflow model load, the Docker image | Not tested yet. This is the next step |
 
 ### Streaming stack for Oracle Cloud (Always Free)
@@ -1779,6 +1797,7 @@ A separate project folder, `oracle-stream/`, holds a production-style version of
 | Every prediction looks wrong, but nothing errors | The `PU_DO` feature does not match training (`43_151` vs `43.0_151.0`) |
 | Duplicate predictions after a restart | Expected after a crash between flush and commit (at-least-once). Downstream consumers should de-duplicate on `ride_id` |
 | Stream runs twice | uvicorn was started with more than one worker. Use one |
+| `git add` or `git push` does not pick up a renamed `Service.py` | git on macOS does not see case-only renames. Run `git mv Service.py service_tmp.py && git mv service_tmp.py service.py`, then commit |
 | `ModuleNotFoundError: confluent_kafka` | `pipenv install confluent-kafka`. It is imported only when the stream starts, so `STREAM=0` runs without it |
 
 ## 🏃 How to Run the Current Iteration
