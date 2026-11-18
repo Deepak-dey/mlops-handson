@@ -119,8 +119,8 @@ def fake_kafka(events,batches, on_empty = None, boom = None):
             events.append(("commit",asynchronous))
         
         def close(self):
-            state["close"] = True
-            events.append(("close",))
+            state["closed"] = True
+            events.append(("closed",))
         
     class Producer:
         def __init__(self,conf):

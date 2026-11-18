@@ -45,7 +45,7 @@ mlflow.set_tracking_uri(os.getenv("MLFLOW_TRACKING_URI", "http://127.0.0.1:5000"
 model = mlflow.sklearn.load_model(f"runs:/{RUN_ID}/{ARTIFACT}")
 
 
-stats = {"streamed":0}
+stats = {"streamed": 0, "error": None}
 
 stop_event = threading.Event()
 
@@ -93,14 +93,18 @@ def stream_loop():
                     rides.append(ride)
                 except (ValueError, KeyError, TypeError) as exc:
                     log.warning("skipping malformed message: %s", exc)
-            if rides:
-                for ride, pred in zip(rides,predict(feats)):
-                    producer.produce(OUT_TOPIC, key=str(ride.get("ride_id"," ")),value=json.dumps({"ride_id":ride.get("ride_id"),"duration":pred,"model_version":RUN_ID}))
-                producer.flush(30)
-                consumer.commit(asynchronous=False)
-                stats["streamed"] += len(rides)
+                    if rides:
+                        for ride, pred in zip(rides, predict(feats)):
+                            producer.produce(OUT_TOPIC, key=str(ride.get("ride_id", "")),
+                                            value=json.dumps({"ride_id": ride.get("ride_id"),
+                                                            "duration": pred,
+                                                            "model_version": RUN_ID}))
+                        producer.flush(30)
+                    consumer.commit(asynchronous=False)
+                    stats["streamed"] += len(rides)
     except Exception:
         log.exception("stream loop stopped")
+        stats["error"] = str(exc)
     finally:
         consumer.close()
 
@@ -125,4 +129,7 @@ def predict_endpoint(ride:Ride):
 
 @app.get('/health')
 def health():
-    return {"model_version": RUN_ID, "streaming": STREAM, "streamed": stats["streamed"]}
+    return {"model_version": RUN_ID,
+            "streaming": STREAM and stats["error"] is None,
+            "streamed": stats["streamed"],
+            "error": stats["error"]}
