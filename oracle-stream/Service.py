@@ -63,46 +63,51 @@ def prepare_features(ride):
 def predict(features_list):
     return [float(p) for p in model.predict(features_list)]
 
+def score_batch(msgs, producer):
+    """Score one batch of Kafka messages. Returns (scored, skipped). Does not flush or commit."""
+    rides, feats, skipped = [], [], 0
+    for m in msgs:
+        if m.error():
+            raise RuntimeError(f"Kafka error: {m.error()}")
+        try:
+            ride = json.loads(m.value())
+            feats.append(prepare_features(ride))
+            rides.append(ride)
+        except (ValueError, KeyError, TypeError) as exc:
+            skipped += 1
+            log.warning("skipping malformed message: %s", exc)
+    if rides:
+        for ride, pred in zip(rides, predict(feats)):
+            producer.produce(OUT_TOPIC, key=str(ride.get("ride_id", "")),
+                             value=json.dumps({"ride_id": ride.get("ride_id"),
+                                               "duration": pred,
+                                               "model_version": RUN_ID}))
+    return len(rides), skipped
 
 def stream_loop():
     from confluent_kafka import Consumer, Producer
-    
-    consumer = Consumer({"bootstrap.servers": BOOTSTRAP, "group.id": "duration-scorer","auto.offset.reset":"earliest","enable.auto.commit":False})
-    
-    producer = Producer(
-        {"bootstrap.servers": BOOTSTRAP}
-    )
-    
+
+    consumer = Consumer({
+        "bootstrap.servers": BOOTSTRAP,
+        "group.id": "duration-scorer",
+        "auto.offset.reset": "earliest",
+        "enable.auto.commit": False,
+    })
+    producer = Producer({"bootstrap.servers": BOOTSTRAP})
     consumer.subscribe([IN_TOPIC])
-    
     log.info("streaming: consuming %s, producing %s", IN_TOPIC, OUT_TOPIC)
-    
+
     try:
         while not stop_event.is_set():
-            msg = consumer.consume(num_messages=BATCH_SIZE,timeout=1.0)
-            if not msg:
+            msgs = consumer.consume(num_messages=BATCH_SIZE, timeout=1.0)
+            if not msgs:
                 continue
-            rides,feats = [],[]
-            
-            for m in msg:
-                if m.error():
-                    raise RuntimeError(f"Kafka error: {m.error()}")
-                try:
-                    ride = json.loads(m.value())
-                    feats.append(prepare_features(ride))
-                    rides.append(ride)
-                except (ValueError, KeyError, TypeError) as exc:
-                    log.warning("skipping malformed message: %s", exc)
-                    if rides:
-                        for ride, pred in zip(rides, predict(feats)):
-                            producer.produce(OUT_TOPIC, key=str(ride.get("ride_id", "")),
-                                            value=json.dumps({"ride_id": ride.get("ride_id"),
-                                                            "duration": pred,
-                                                            "model_version": RUN_ID}))
-                        producer.flush(30)
-                    consumer.commit(asynchronous=False)
-                    stats["streamed"] += len(rides)
-    except Exception:
+
+            scored, _ = score_batch(msgs, producer)
+            producer.flush(30)
+            consumer.commit(asynchronous=False)
+            stats["streamed"] += scored
+    except Exception as exc:
         log.exception("stream loop stopped")
         stats["error"] = str(exc)
     finally:

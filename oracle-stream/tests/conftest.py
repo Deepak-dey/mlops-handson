@@ -44,15 +44,14 @@ def ride_message(i = 1, **overrides):
     return FakeMessage(json.dumps(body).encode())
 
 class FakeProducer:
-    def __init__(self,events):
+    def __init__(self, events):
         self.events = events
-    
-    def producer(self, topic, key = None, value = None,**_):
-        self.events.append(("producer",topic, key,json.loads(value)))
-        
-    def flush(self, timeout = None):
-        self.events.append(("flush",))
 
+    def produce(self, topic, key=None, value=None, **_):
+        self.events.append(("produce", topic, key, json.loads(value)))
+
+    def flush(self, timeout=None):
+        self.events.append(("flush",))
 
 @pytest.fixture
 def events():
@@ -120,7 +119,7 @@ def fake_kafka(events,batches, on_empty = None, boom = None):
         
         def close(self):
             state["closed"] = True
-            events.append(("closed",))
+            events.append(("close",))
         
     class Producer:
         def __init__(self,conf):
