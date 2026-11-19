@@ -46,3 +46,26 @@ def test_score_batch_produces_one_message_per_good_ride(load_service,producer,ev
     assert {e[3]["model_version"] for e in produced} == {"run-xyz"}
     assert all(isinstance(e[3]["duration"], float) for e in produced)
     
+def test_score_batch_skips_malformed_messages(load_service, producer, events):
+    svc = load_service()
+    msgs = [ride_message(1), FakeMessage(b"not json"), FakeMessage(json.dumps({"ride_id":"x"}).encode()),
+            ride_message(2,trip_distance = "far")]
+    assert svc.score_batch(msgs,producer) == (1,3)
+    assert [e[2] for e in events if e[0] == "produce"] == ["r1"]
+    
+
+def test_score_batch_matches_the_model(load_service,producer,events,tiny_model):
+    svc = load_service()
+    svc.score_batch(
+        [ride_message(1)], producer
+    )
+    expected = float(tiny_model.predict([{"PU_DO": "43_151", "trip_distance": 1.2}])[0])
+    assert events[0][3]["duration"] == pytest.approx(expected)
+
+def test_score_batch_raises_on_a_kafka_error(load_service,producer,events):
+    svc = load_service()
+    with pytest.raises(RuntimeError, match="boom"):
+        svc.score_batch([ride_message(1), FakeMessage(error="boom")],producer)
+    assert events == []
+    
+    
