@@ -72,6 +72,8 @@ Applying AI to optimize system operations and infrastructure.
 - [x] Phase 1: Streaming scorer `service.py`: FastAPI `/predict` plus a Kafka consumer/producer loop, model loaded from MLflow by run ID
 - [x] Phase 1: pytest suite for the streaming service (`conftest.py`, `test_service.py`, `test_service_http.py`) with fakes, no Kafka or MLflow needed
 - [x] Phase 1: First pytest run on the Mac: fixed test typos (`422`, `TestClient`), three `conftest.py` bugs (`produce`, `closed`, `service.py` file-name case) and made `/health` report a crashed stream
+- [x] Phase 1: Refactored the stream loop in `service.py`: scoring moved into `score_batch(msgs, producer)`, the loop only flushes, commits and counts
+- [x] Phase 1: `test_service.py` written by hand (16 tests: features, `score_batch`, stream loop), plus 9 HTTP tests in `test_service_http.py`
 - [ ] Phase 1: Dockerfile and Docker Compose for the streaming stack (Redpanda, service, producer)
 - [ ] Phase 1: Deploy the streaming stack to the Oracle Cloud free tier (written up, not deployed: no free Arm capacity yet)
 - [ ] Phase 1: Build Grafana dashboard panels on the metrics table
@@ -1615,8 +1617,22 @@ Typical first-run failures and their causes:
 | `AttributeError` on `producer.produce` | The fake producer method was named `producer`. It must be `produce`, and log `("produce", ...)` |
 | Fails on Linux or CI but passes on the Mac | `conftest.py` loads `Service.py` instead of `service.py` |
 | Only the HTTP file ran | A single file was passed to `pytest`. Run `pytest -v` for all files |
+| `AttributeError: module 'service_under_test' has no attribute 'pepare_features'` | Typo in the test. The function is `prepare_features`. Search the test file for every spelling of the name |
+| `AttributeError: ... no attribute 'score_batch'` | The scoring code was still inline in `stream_loop`. Move it into `score_batch(msgs, producer)` |
+| `/health` shows `streaming: false` in the stream test | The stream thread crashed. The log shows why (here: the fake producer had no `produce` method) |
+| `NameError: name 'feats' is not defined` after the refactor | The old inline `for m in msgs:` block was left under the new `score_batch` call. Delete it |
+| `NameError: name 'exc' is not defined` in the crash handler | Write `except Exception as exc:`. Without `as exc`, `str(exc)` fails and the error is never recorded |
 
 **These tests caught real bugs.** Putting each original mistake back into `service.py` made a test fail: `json.load` instead of `json.loads` (an unhandled `AttributeError` that killed the stream thread silently), a typo in the `ride_id` key (every output had `ride_id: null`), `flush`/`commit` inside the per-message loop (one commit per ride and overcounted stats), `consumer.close` without `()`, and committing before flushing.
+
+**Refactoring the loop.** The first version of `service.py` scored messages inline inside `stream_loop`. Pulling that into `score_batch` keeps the loop small and makes the scoring testable without Kafka. The split of responsibilities:
+
+| Function | Does | Does not |
+|---|---|---|
+| `score_batch(msgs, producer)` | Parses, predicts, produces; returns `(scored, skipped)`; raises on a Kafka error | flush or commit |
+| `stream_loop()` | Consumes, calls `score_batch`, flushes, commits, counts, records a crash in `stats["error"]`, closes the consumer | parse or predict |
+
+Because `score_batch` raises before producing anything when a message carries a Kafka error, a failed batch is never flushed or committed (`test_nothing_is_committed_when_a_batch_fails`).
 
 `conftest.py` holds the shared fakes. `load_service(...)` imports a fresh `service.py` with the fakes installed, and `fake_kafka(...)` builds a fake `confluent_kafka` that hands out batches and stops the loop when they run out:
 
