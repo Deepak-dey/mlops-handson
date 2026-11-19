@@ -67,5 +67,41 @@ def test_score_batch_raises_on_a_kafka_error(load_service,producer,events):
     with pytest.raises(RuntimeError, match="boom"):
         svc.score_batch([ride_message(1), FakeMessage(error="boom")],producer)
     assert events == []
+
+# ---------- stream_loop ----------    
+
+def run_loop(load_service, events, batches, **kw):
+    box = {}
+    kafka = fake_kafka(events, batches, on_empty=lambda: box['svc'].stop_event.set(),**kw)
+    box["svc"] = load_service(stream = "1", kafka = kafka)
+    box["svc"].stream_loop()
+    return box["svc"], kafka
+
+def test_loop_flushes_then_commits_once_per_batch(load_service, events):
+    run_loop(load_service, events, [[ride_message(1), ride_message(2)], [ride_message(3)]])
+    kinds = [e[0] for e in events if e[0] in ("produce", "flush", "commit")]
+    assert kinds == ["produce", "produce", "flush", "commit", "produce", "flush", "commit"]
+
+def test_loop_counts_each_ride_once(load_service,events):
+    svc,_ = run_loop(load_service, events, [[ride_message(i) for i in range(5)],[ride_message(9)]])
+    assert svc.stats["streamed"] == 6 and svc.stats["error"] is None
     
+def test_loop_commits_manually_and_reads_from_the_start(load_service, events):
+    _,kafka = run_loop(load_service,events,[])
+    assert kafka.state["conf"]["enable.auto.commit"] is False
+    assert kafka.state["conf"]["auto.offset.reset"] == "earliest"
+    assert ("subscribe", ["rides"]) in events
     
+def test_loop_closes_the_consumer_on_a_clean_stop(load_service, events):
+    _,kafka = run_loop(load_service,events,[[ride_message(1)]])
+    assert kafka.state["closed"] is True
+
+def test_a_crash_is_recorded_and_the_consumer_still_closes(load_service, events):
+    svc,kafka = run_loop(load_service,events,[], boom = ConnectionError("broker gone"))
+    assert svc.stats["error"] == "broker gone"
+    assert kafka.state["closed"] is True
+
+def test_nothing_is_committed_when_a_batch_fails(load_service, events):
+    svc,_ = run_loop(load_service,events,[[ride_message(1),FakeMessage(error= "boom")]])
+    assert not any(e[0] in ("flush","commit") for e in events)
+    assert svc.stats["streamed"] == 0
