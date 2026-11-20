@@ -1,0 +1,72 @@
+services:
+  redpanda:
+    image: docker.redpanda.com/redpandadata/redpanda:v25.3.18
+    command:
+      - redpanda
+      - start
+      - --mode=dev-container
+      - --smp=1
+      - --memory=1G
+      - --kafka-addr=0.0.0.0:9092
+      - --advertise-kafka-addr=redpanda:9092
+    mem_limit: 1536m
+    volumes:
+      - redpanda_data:/var/lib/redpanda/data
+    healthcheck:
+      test: ["CMD-SHELL", "rpk cluster health | grep -E 'Healthy:.+true' || exit 1"]
+      interval: 10s
+      timeout: 5s
+      retries: 12
+      start_period: 15s
+    restart: unless-stopped
+
+  # one-shot job: creates the two topics, then exits
+  topics:
+    image: docker.redpanda.com/redpandadata/redpanda:v25.3.18
+    entrypoint: ["/bin/sh", "-c"]
+    command:
+      - rpk -X brokers=redpanda:9092 topic create rides predictions --partitions 3 --replicas 1 || true
+    depends_on:
+      redpanda:
+        condition: service_healthy
+    restart: "no"
+
+  # service.py: POST /predict and the Kafka stream loop in one process.
+  # Run exactly one copy: a second copy would join the same consumer group and split the partitions.
+  service:
+    build:
+      context: .
+      args:
+        SKLEARN_VERSION: ${SKLEARN_VERSION:?set SKLEARN_VERSION in .env}
+        MLFLOW_VERSION: ${MLFLOW_VERSION:?set MLFLOW_VERSION in .env}
+    image: duration-service:${IMAGE_TAG:-latest}   # `make up` sets IMAGE_TAG to <date>-<time>-<n>
+    entrypoint: ["uvicorn", "service:app", "--host", "0.0.0.0", "--port", "9696"]
+    environment:
+      RUN_ID: ${RUN_ID:?set RUN_ID in .env}
+      MODEL_ARTIFACT: ${MODEL_ARTIFACT:-model}
+      MLFLOW_TRACKING_URI: "sqlite:///${MLFLOW_DIR:?set MLFLOW_DIR in .env}/mlflow.db"
+      KAFKA_BOOTSTRAP: redpanda:9092
+      IN_TOPIC: rides
+      OUT_TOPIC: predictions
+    volumes:
+      # same path on both sides: MLflow stores absolute artifact paths, so they must resolve inside the container
+      - ${MLFLOW_DIR}:${MLFLOW_DIR}
+    ports:
+      - "127.0.0.1:9696:9696"        # localhost only
+    healthcheck:
+      # unhealthy when the stream thread has crashed, not only when the API is down
+      test: ["CMD", "python", "-c", "import json,urllib.request as u; assert json.load(u.urlopen('http://localhost:9696/health', timeout=3))['streaming']"]
+      interval: 10s
+      timeout: 5s
+      retries: 6
+      start_period: 60s              # the model is loaded when the app starts
+    mem_limit: 1g
+    depends_on:
+      redpanda:
+        condition: service_healthy
+      topics:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  redpanda_data:
