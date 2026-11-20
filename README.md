@@ -47,6 +47,7 @@ Applying AI to optimize system operations and infrastructure.
 - **Serving:** Flask, Gunicorn, FastAPI, Uvicorn
 - **Streaming:** Redpanda (Kafka API), confluent-kafka
 - **Testing:** pytest (fakes for MLflow, Kafka and Postgres), FastAPI TestClient
+- **Code quality:** black, isort, pylint
 - **Dependency Management:** Pipenv
 - **DevOps & Deployment:** Docker, GitHub Actions
 
@@ -74,7 +75,9 @@ Applying AI to optimize system operations and infrastructure.
 - [x] Phase 1: First pytest run on the Mac: fixed test typos (`422`, `TestClient`), three `conftest.py` bugs (`produce`, `closed`, `service.py` file-name case) and made `/health` report a crashed stream
 - [x] Phase 1: Refactored the stream loop in `service.py`: scoring moved into `score_batch(msgs, producer)`, the loop only flushes, commits and counts
 - [x] Phase 1: `test_service.py` written by hand (16 tests: features, `score_batch`, stream loop), plus 9 HTTP tests in `test_service_http.py`
-- [ ] Phase 1: Dockerfile and Docker Compose for the streaming stack (Redpanda, service, producer)
+- [x] Phase 1: Dockerfile, Docker Compose (Redpanda, topic job, `service`) and Makefile for `service.py`; images tagged `duration-service:<date>-<time>-<n>`
+- [x] Phase 1: `tests/run_checks.sh`: starts the stack, then runs black, isort, pylint and pytest
+- [ ] Phase 1: First clean run of `make checks` and of the stack against real Redpanda
 - [ ] Phase 1: Deploy the streaming stack to the Oracle Cloud free tier (written up, not deployed: no free Arm capacity yet)
 - [ ] Phase 1: Build Grafana dashboard panels on the metrics table
 - [ ] Phase 1: CI/CD with GitHub Actions
@@ -1397,12 +1400,15 @@ Redpanda is used because it speaks the Kafka API with one small container, so th
 ```
 oracle-stream/
 ├── service.py                 # FastAPI app + Kafka stream loop in one process
-├── pytest.ini
-├── requirements-dev.txt
+├── Dockerfile                 # installs only what service.py needs
+├── docker-compose.yml         # redpanda, topics (one-shot), service
+├── Makefile                   # up, ps, logs, send, results, predict, checks, down
+├── .env.example               # copy to .env: RUN_ID, MLflow and scikit-learn versions, MLFLOW_DIR
 └── tests/
     ├── conftest.py            # fake MLflow, fake Kafka, tiny model
     ├── test_service.py        # features, batch scoring, stream loop
-    └── test_service_http.py   # FastAPI endpoints (needs fastapi + httpx)
+    ├── test_service_http.py   # FastAPI endpoints (needs fastapi + httpx)
+    └── run_checks.sh          # up, ps, black, isort, pylint, pytest
 ```
 
 The tests expect `service.py` one level above `tests/`. Run `pytest` from this folder (`oracle-stream/`), which is also the pytest root.
@@ -1783,7 +1789,57 @@ def fake_kafka(events, batches, on_empty=None, boom=None):
 |---|---|
 | Features, batch scoring and the stream loop | Covered by `test_service.py` against fakes |
 | FastAPI endpoints and the app lifecycle | `test_service_http.py` ran on the Mac. Its failures were typos in the tests and the fake Kafka in `conftest.py`, not in the service |
-| Real Kafka or Redpanda, a real MLflow model load, the Docker image | Not tested yet. This is the next step |
+| Compose file, Dockerfile, Makefile | The compose file passes `docker compose config`. The first image build and a real run against Redpanda are not confirmed yet |
+| Real Kafka or Redpanda and a real MLflow model load | Not tested yet. `make up`, then `make send` and `make results`, is the first real test |
+
+### Running it in Docker
+
+`docker-compose.yml` starts three things: `redpanda`, a one-shot `topics` job that creates `rides` and `predictions` (3 partitions), and `service`, which is `service.py` (the HTTP API and the stream loop in one process). Run exactly one copy of `service`: a second copy would join the same consumer group and split the partitions.
+
+Setup once:
+
+```bash
+cp .env.example .env        # then fill in the values below
+```
+
+| Variable | Meaning |
+|---|---|
+| `RUN_ID` | MLflow run that holds the model (required) |
+| `MODEL_ARTIFACT` | Artifact folder in the run, `model` by default (`model-rf` for the random forest) |
+| `SKLEARN_VERSION`, `MLFLOW_VERSION` | Exact versions from the training environment (`pip show scikit-learn mlflow`). The image is built with them, and the build stops if they are empty |
+| `MLFLOW_DIR` | Absolute path of the folder that holds `mlflow.db` and the artifacts |
+| `IMAGE_TAG` | Set by `make up`; `latest` for other commands |
+
+How the container finds the model: `service.py` loads `runs:/<RUN_ID>/<MODEL_ARTIFACT>` from MLflow, and MLflow stores **absolute** artifact paths. So `MLFLOW_DIR` is mounted at the **same path** inside the container, and `MLFLOW_TRACKING_URI` points at the `mlflow.db` there. Check that the run's artifact path is inside `MLFLOW_DIR`:
+
+```python
+mlflow.get_run("<RUN_ID>").info.artifact_uri
+```
+
+Image names are `duration-service:<date>-<time>-<n>`, for example `duration-service:20261120-1115-1`. If you rebuild within the same minute the number goes up (`-2`). `make up` also tags the build `latest`, so `docker compose` commands use the same image.
+
+The container's health check calls `/health` and fails when `streaming` is false, so a crashed stream thread shows as unhealthy and not only a dead API.
+
+```bash
+make up           # build and start
+make ps           # containers and health
+curl localhost:9696/health
+make predict      # one ride through the HTTP API
+make send         # put one ride on the `rides` topic
+make results      # read the prediction from the `predictions` topic
+make logs         # follow the service log
+make down
+```
+
+### Code-quality checks
+
+`tests/run_checks.sh` (also `make checks`) runs, in this order and stopping at the first failure: `make up`, `docker compose ps`, `black`, `isort --profile black`, `pylint --fail-under=8` and `pytest -v`. It runs the tools through `pipenv run`, so they come from the Pipfile. By default black and isort only check; `FIX=1 make checks` lets them reformat `service.py` first.
+
+```bash
+pipenv install --dev black isort pylint pytest httpx
+FIX=1 make checks      # first run: format service.py
+make checks            # afterwards
+```
 
 ### Streaming stack for Oracle Cloud (Always Free)
 
@@ -1797,10 +1853,11 @@ A separate project folder, `oracle-stream/`, holds a production-style version of
 
 ### Next steps
 
-1. Dockerfile for `service.py`. The container needs the model without the MLflow server, so export it once (`mlflow.artifacts.download_artifacts(...)` or `export_model.py`) and load it from a file.
-2. Docker Compose with Redpanda, a one-shot topic creation job, the service and a producer that replays NYC TLC rides.
+1. First real run: `make checks`, then `make send` and `make results` against Redpanda. Fix whatever black and pylint report.
+2. A producer that replays NYC TLC rides into `rides` (today `make send` sends one ride).
 3. Per-minute metrics in Postgres and Grafana panels (reuse the monitoring stack above).
-4. CI with GitHub Actions: run the pytest suite and build the image on every push.
+4. CI with GitHub Actions: run the pytest suite and the code-quality checks, and build the image, on every push.
+5. Oracle deployment: the container then has no MLflow server, so the model has to come from an exported file (see the Oracle stack above).
 
 ### Troubleshooting (streaming service)
 
@@ -1812,6 +1869,11 @@ A separate project folder, `oracle-stream/`, holds a production-style version of
 | `/health` shows `streamed` stuck at 0 | No messages arrive on `rides`, or the consumer group `duration-scorer` already read them (it commits offsets). Use a new group name, or reset the group offsets |
 | Every prediction looks wrong, but nothing errors | The `PU_DO` feature does not match training (`43_151` vs `43.0_151.0`) |
 | Duplicate predictions after a restart | Expected after a crash between flush and commit (at-least-once). Downstream consumers should de-duplicate on `ride_id` |
+| `required variable RUN_ID is missing a value` (or `SKLEARN_VERSION`, `MLFLOW_VERSION`, `MLFLOW_DIR`) | `.env` is missing or incomplete. `cp .env.example .env` and fill it in |
+| The container starts but the model is not found | The run's artifact path is outside `MLFLOW_DIR`, or `MODEL_ARTIFACT` is wrong. Print `info.artifact_uri` and mount the folder that contains it |
+| Container shows `unhealthy` and `/health` has an `error` | The stream thread crashed (usually Kafka not reachable). `make logs` shows the traceback |
+| `pipenv install --dev install black ...` fails with `No matching distribution found for install` | The extra word `install` was taken as a package name. Remove `install = "*"` from the Pipfile and run `pipenv install --dev black isort pylint` |
+| `./tests/run_checks.sh`: `missing .env` | Create it first: `cp .env.example .env` |
 | Stream runs twice | uvicorn was started with more than one worker. Use one |
 | `git add` or `git push` does not pick up a renamed `Service.py` | git on macOS does not see case-only renames. Run `git mv Service.py service_tmp.py && git mv service_tmp.py service.py`, then commit |
 | `ModuleNotFoundError: confluent_kafka` | `pipenv install confluent-kafka`. It is imported only when the stream starts, so `STREAM=0` runs without it |
@@ -1896,7 +1958,7 @@ Python 3.10+, `venv`, and Docker (for the web service) installed.
 
 14. Run the streaming service API on its own (set `RUN_ID` and `MODEL_ARTIFACT` from the MLflow UI), then call it:
     ```bash
-    cd deployment/streaming
+    cd oracle-stream
     STREAM=0 uvicorn service:app --port 9696
     curl -X POST localhost:9696/predict -H 'Content-Type: application/json' \
       -d '{"PULocationID": 43, "DOLocationID": 151, "trip_distance": 1.2}'
@@ -1904,7 +1966,21 @@ Python 3.10+, `venv`, and Docker (for the web service) installed.
 
 15. Run the streaming service tests (no Kafka or MLflow needed):
     ```bash
-    cd deployment/streaming
-    pipenv install --dev -r requirements-dev.txt
-    pipenv run pytest
+    cd oracle-stream
+    pipenv install --dev pytest httpx
+    pipenv run pytest -v
+    ```
+
+16. Run the whole streaming stack in Docker (fill in `.env` first, see "Running it in Docker"):
+    ```bash
+    cd oracle-stream
+    cp .env.example .env
+    make up && make ps
+    make send && make results
+    ```
+
+17. Run the code-quality checks together with the stack and the tests:
+    ```bash
+    FIX=1 make checks      # first time: black and isort reformat service.py
+    make checks
     ```
