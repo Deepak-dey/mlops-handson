@@ -77,6 +77,7 @@ Applying AI to optimize system operations and infrastructure.
 - [x] Phase 1: `test_service.py` written by hand (16 tests: features, `score_batch`, stream loop), plus 9 HTTP tests in `test_service_http.py`
 - [x] Phase 1: Dockerfile, Docker Compose (Redpanda, topic job, `service`) and Makefile for `service.py`; images tagged `duration-service:<date>-<time>-<n>`
 - [x] Phase 1: `tests/run_checks.sh`: starts the stack, then runs black, isort, pylint and pytest
+- [ ] Phase 1: Match `MLFLOW_VERSION` and `SKLEARN_VERSION` to the environment that wrote `mlflow.db` (the `.venv` MLflow is older and cannot open it)
 - [ ] Phase 1: First clean run of `make checks` and of the stack against real Redpanda
 - [ ] Phase 1: Deploy the streaming stack to the Oracle Cloud free tier (written up, not deployed: no free Arm capacity yet)
 - [ ] Phase 1: Build Grafana dashboard panels on the metrics table
@@ -1806,7 +1807,7 @@ cp .env.example .env        # then fill in the values below
 |---|---|
 | `RUN_ID` | MLflow run that holds the model (required) |
 | `MODEL_ARTIFACT` | Artifact folder in the run, `model` by default (`model-rf` for the random forest) |
-| `SKLEARN_VERSION`, `MLFLOW_VERSION` | Exact versions from the training environment (`pip show scikit-learn mlflow`). The image is built with them, and the build stops if they are empty |
+| `SKLEARN_VERSION`, `MLFLOW_VERSION` | Exact versions from the environment that **trained the model and wrote `mlflow.db`** (run `python -c "import mlflow, sklearn; print(mlflow.__version__, sklearn.__version__)"` there). This is not necessarily the project `.venv`: here the `.venv` MLflow is older than the one that created the database. The image is built with these versions, and the build stops if they are empty |
 | `MLFLOW_DIR` | Absolute path of the folder that holds `mlflow.db` and the artifacts |
 | `IMAGE_TAG` | Set by `make up`; `latest` for other commands |
 
@@ -1816,7 +1817,34 @@ How the container finds the model: `service.py` loads `runs:/<RUN_ID>/<MODEL_ART
 mlflow.get_run("<RUN_ID>").info.artifact_uri
 ```
 
+Create the files from the terminal if your editor or Finder hides names that start with a dot (`.env`, `.env.example`). `.env` only needs these lines:
+
+```bash
+cat > .env <<'EOF'
+SKLEARN_VERSION=
+MLFLOW_VERSION=
+RUN_ID=
+MODEL_ARTIFACT=model
+MLFLOW_DIR=/Users/<you>/mlops/mlops-handson/experiment
+IMAGE_TAG=latest
+EOF
+```
+
+Use the MLflow version that wrote the database, so the container does not upgrade the schema when it starts (an upgrade would stop older tools from opening `mlflow.db`). Back the database up first, **outside the repository**:
+
+```bash
+mkdir -p ~/mlflow_backups && cp experiment/mlflow.db ~/mlflow_backups/mlflow.db.$(date +%Y%m%d)
+```
+
 Image names are `duration-service:<date>-<time>-<n>`, for example `duration-service:20261120-1115-1`. If you rebuild within the same minute the number goes up (`-2`). `make up` also tags the build `latest`, so `docker compose` commands use the same image.
+
+Keep these out of git: `.env`, `mlflow.db` and any copy or backup of it (`*.db.bak`). A tracking database can hold values you logged yourself, and GitHub push protection blocks pushes that contain something that looks like a credential. Add them to `.gitignore`:
+
+```
+.env
+*.db
+*.db.bak
+```
 
 The container's health check calls `/health` and fails when `streaming` is false, so a crashed stream thread shows as unhealthy and not only a dead API.
 
@@ -1853,7 +1881,7 @@ A separate project folder, `oracle-stream/`, holds a production-style version of
 
 ### Next steps
 
-1. First real run: `make checks`, then `make send` and `make results` against Redpanda. Fix whatever black and pylint report.
+1. Fix the MLflow version mismatch (use the versions of the environment that wrote `mlflow.db`), fill `.env`, then the first real run: `make checks`, `make send` and `make results` against Redpanda. Fix whatever black and pylint report.
 2. A producer that replays NYC TLC rides into `rides` (today `make send` sends one ride).
 3. Per-minute metrics in Postgres and Grafana panels (reuse the monitoring stack above).
 4. CI with GitHub Actions: run the pytest suite and the code-quality checks, and build the image, on every push.
@@ -1874,6 +1902,10 @@ A separate project folder, `oracle-stream/`, holds a production-style version of
 | Container shows `unhealthy` and `/health` has an `error` | The stream thread crashed (usually Kafka not reachable). `make logs` shows the traceback |
 | `pipenv install --dev install black ...` fails with `No matching distribution found for install` | The extra word `install` was taken as a package name. Remove `install = "*"` from the Pipfile and run `pipenv install --dev black isort pylint` |
 | `./tests/run_checks.sh`: `missing .env` | Create it first: `cp .env.example .env` |
+| `docker: No such file or directory` (also from `make check`) | The Docker CLI is not on `PATH`. `export PATH="$PATH:/Applications/Docker.app/Contents/Resources/bin"` (put it in `~/.zshrc`), then start Docker Desktop with `open -a Docker` |
+| `cp: .env.example: No such file or directory`, or `make up` cannot find a `Dockerfile` | Files whose names start with a dot, or that were never copied, are missing. Create `.env` and the `Dockerfile` from the terminal with the `cat > ... <<'EOF'` commands, and check with `ls -a` |
+| `Can't locate revision identified by '...'` from `mlflow ui` in the `.venv` | `mlflow.db` was written by a newer MLflow than the one in the `.venv`. Open it with the MLflow of the environment that wrote it, and use that environment's versions in `.env`. Back up the database first and do not run `mlflow db upgrade` with the older version |
+| `git push` rejected: `GH013 ... Push cannot contain secrets` | A file in the commit holds something that looks like a secret (here a copy of `mlflow.db`). Do not use the "allow the secret" link. Remove the file from the unpushed commits (`git reset --soft origin/main`, then `git restore --staged <file>`), add it to `.gitignore` and commit again. Check whether `mlflow.db` itself is tracked (`git ls-files experiment`) |
 | Stream runs twice | uvicorn was started with more than one worker. Use one |
 | `git add` or `git push` does not pick up a renamed `Service.py` | git on macOS does not see case-only renames. Run `git mv Service.py service_tmp.py && git mv service_tmp.py service.py`, then commit |
 | `ModuleNotFoundError: confluent_kafka` | `pipenv install confluent-kafka`. It is imported only when the stream starts, so `STREAM=0` runs without it |
