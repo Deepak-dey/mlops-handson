@@ -225,3 +225,6 @@ mlruns/
 mlflow.db
 data/
 .git
+
+*.db.bak
+.env
