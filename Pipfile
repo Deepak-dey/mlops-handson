@@ -26,6 +26,8 @@ confluent-kafka = "*"
 black = "*"
 isort = "*"
 pylint = "*"
+pytest = "*"
+httpx = "*"
 
 [requires]
 python_version = "3.9"

@@ -12,9 +12,9 @@ export PIPENV_VERBOSITY=-1
 
 BLACK_FLAGS="--check"
 ISORT_FLAGS="--check-only"
-if ["${FIX:-0}"=="1"]; then
-    BLACK_FLAGS=""
-    ISORT_FLAGS=""
+if [ "${FIX:-0}" = "1" ]; then
+  BLACK_FLAGS=""
+  ISORT_FLAGS=""
 fi
 
 [ -f .env ] || { echo "missing .env: run  cp .env.example .env  and fill it in"; exit 1; }
