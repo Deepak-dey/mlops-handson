@@ -51,6 +51,8 @@ services:
     volumes:
       # same path on both sides: MLflow stores absolute artifact paths, so they must resolve inside the container
       - ${MLFLOW_DIR}:${MLFLOW_DIR}
+      # the run's artifacts live in another folder (see `artifact_uri`); read-only is enough
+      - ${MLFLOW_ARTIFACTS_DIR:?set MLFLOW_ARTIFACTS_DIR in .env}:${MLFLOW_ARTIFACTS_DIR}:ro
     ports:
       - "127.0.0.1:9696:9696"        # localhost only
     healthcheck:

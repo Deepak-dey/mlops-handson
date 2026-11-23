@@ -6,9 +6,9 @@ check:   ## build and start as duration-service:<date>-<time>-<n>
 	docker compose config --quiet
 
 up:
-	@n=1; while image inspect duration-service:$(STAMP)-$$n >/dev/null 2>&1; do n=$$((n+1)); done; \
+	@n=1; while docker image inspect duration-service:$(STAMP)-$$n >/dev/null 2>&1; do n=$$((n+1)); done; \
 	tag=$(STAMP)-$$n; IMAGE_TAG=$$tag docker compose up -d --build && \
-	docker tag duration-service:$$tag duration-service:latest && echo "runnung duration-service:$$tag"
+	docker tag duration-service:$$tag duration-service:latest && echo "running duration-service:$$tag"
 
 ps:    ## containers and their health
 	docker compose ps
@@ -26,7 +26,7 @@ results: ## read what the service wrote to the `predictions` topic
 	docker compose exec redpanda rpk topic consume predictions -o start -n 1
 
 predict: ## one ride through the HTTP API
-	curl -s -X POST localhost:9096/predict -H 'Content-Type: application/json' -d '{"PULocationID": 43, "DOLocationID": 151, "trip_distance": 1.2}'
+	curl -s -X POST localhost:9696/predict -H 'Content-Type: application/json' -d '{"PULocationID": 43, "DOLocationID": 151, "trip_distance": 1.2}'
 
 checks:          ## up + ps + black + isort + pylint + pytest   (FIX=1 make checks lets black/isort rewrite)
 	./test/run_checks.sh
