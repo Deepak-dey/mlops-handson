@@ -77,8 +77,10 @@ Applying AI to optimize system operations and infrastructure.
 - [x] Phase 1: `test_service.py` written by hand (16 tests: features, `score_batch`, stream loop), plus 9 HTTP tests in `test_service_http.py`
 - [x] Phase 1: Dockerfile, Docker Compose (Redpanda, topic job, `service`) and Makefile for `service.py`; images tagged `duration-service:<date>-<time>-<n>`
 - [x] Phase 1: `tests/run_checks.sh`: starts the stack, then runs black, isort, pylint and pytest
-- [ ] Phase 1: Match `MLFLOW_VERSION` and `SKLEARN_VERSION` to the environment that wrote `mlflow.db` (the `.venv` MLflow is older and cannot open it)
-- [ ] Phase 1: First clean run of `make checks` and of the stack against real Redpanda
+- [x] Phase 1: Matched `MLFLOW_VERSION` (3.17.2) and `SKLEARN_VERSION` (1.5.1) to the conda environment that wrote `mlflow.db` (the `.venv` MLflow is older and cannot open it)
+- [x] Phase 1: First `make up`: image built (Python 3.12), Redpanda healthy, topics created, `service` started
+- [x] Phase 1: Found why the model did not load: MLflow 3 stores models as logged models, so `MODEL_ARTIFACT` is the logged model's name (`model-rf`) and its folder needs its own mount (`MLFLOW_ARTIFACTS_DIR`)
+- [ ] Phase 1: `/health` shows `streaming: true`, then `make predict`, `make send` and `make results` work, then `make checks` is clean
 - [ ] Phase 1: Deploy the streaming stack to the Oracle Cloud free tier (written up, not deployed: no free Arm capacity yet)
 - [ ] Phase 1: Build Grafana dashboard panels on the metrics table
 - [ ] Phase 1: CI/CD with GitHub Actions
@@ -1404,7 +1406,7 @@ oracle-stream/
 ├── Dockerfile                 # installs only what service.py needs
 ├── docker-compose.yml         # redpanda, topics (one-shot), service
 ├── Makefile                   # up, ps, logs, send, results, predict, checks, down
-├── .env.example               # copy to .env: RUN_ID, MLflow and scikit-learn versions, MLFLOW_DIR
+├── .env.example               # copy to .env: RUN_ID, MODEL_ARTIFACT, versions, MLFLOW_DIR, MLFLOW_ARTIFACTS_DIR
 └── tests/
     ├── conftest.py            # fake MLflow, fake Kafka, tiny model
     ├── test_service.py        # features, batch scoring, stream loop
@@ -1565,7 +1567,7 @@ def health():
 |---|---|---|
 | `RUN_ID` | required | MLflow run that holds the model |
 | `MLFLOW_TRACKING_URI` | `http://127.0.0.1:5000` | Tracking server or `sqlite:////absolute/path/mlflow.db` |
-| `MODEL_ARTIFACT` | `model` | Artifact folder in the run (`model-rf` for the random forest logged above) |
+| `MODEL_ARTIFACT` | `model` | Name the model was logged under (`model-rf` for the random forest logged above) |
 | `KAFKA_BOOTSTRAP` | `localhost:9092` | Kafka or Redpanda address |
 | `IN_TOPIC`, `OUT_TOPIC` | `rides`, `predictions` | Topic names |
 | `BATCH_SIZE` | `200` | Messages read per batch |
@@ -1576,7 +1578,7 @@ def health():
 ```bash
 pipenv install fastapi "uvicorn[standard]" confluent-kafka mlflow "scikit-learn==<training version>"
 export RUN_ID=<run id>
-export MODEL_ARTIFACT=model-rf        # the folder shown in the run's Artifacts tab
+export MODEL_ARTIFACT=model-rf        # the name the model was logged under
 export MLFLOW_TRACKING_URI=sqlite:////absolute/path/to/mlflow.db
 STREAM=0 pipenv run uvicorn service:app --host 0.0.0.0 --port 9696
 ```
@@ -1806,16 +1808,30 @@ cp .env.example .env        # then fill in the values below
 | Variable | Meaning |
 |---|---|
 | `RUN_ID` | MLflow run that holds the model (required) |
-| `MODEL_ARTIFACT` | Artifact folder in the run, `model` by default (`model-rf` for the random forest) |
+| `MODEL_ARTIFACT` | Name the model was logged under in that run, `model` by default (`model-rf` for the random forest). See "Finding the model name" below |
 | `SKLEARN_VERSION`, `MLFLOW_VERSION` | Exact versions from the environment that **trained the model and wrote `mlflow.db`** (run `python -c "import mlflow, sklearn; print(mlflow.__version__, sklearn.__version__)"` there). This is not necessarily the project `.venv`: here the `.venv` MLflow is older than the one that created the database. The image is built with these versions, and the build stops if they are empty |
-| `MLFLOW_DIR` | Absolute path of the folder that holds `mlflow.db` and the artifacts |
+| `MLFLOW_DIR` | Absolute path of the folder that holds `mlflow.db` |
+| `MLFLOW_ARTIFACTS_DIR` | Absolute path of the folder that holds the model files, i.e. the `mlruns` folder that the logged model's `artifact_location` points into (here `hands-on1/mlruns`). Mounted read-only |
 | `IMAGE_TAG` | Set by `make up`; `latest` for other commands |
 
-How the container finds the model: `service.py` loads `runs:/<RUN_ID>/<MODEL_ARTIFACT>` from MLflow, and MLflow stores **absolute** artifact paths. So `MLFLOW_DIR` is mounted at the **same path** inside the container, and `MLFLOW_TRACKING_URI` points at the `mlflow.db` there. Check that the run's artifact path is inside `MLFLOW_DIR`:
+How the container finds the model: `service.py` loads `runs:/<RUN_ID>/<MODEL_ARTIFACT>` from MLflow. The container has no MLflow server, so it reads the database and the model files from your disk. MLflow stores **absolute** paths, so each folder is mounted at the **same path** inside the container: `MLFLOW_DIR` (holds `mlflow.db`, which `MLFLOW_TRACKING_URI` points at) and `MLFLOW_ARTIFACTS_DIR` (holds the model files).
+
+**With MLflow 3, a model is not a folder inside the run.** It is stored as a *logged model* under `.../mlruns/<experiment>/models/m-<id>/artifacts`, and the run's own `artifacts/` folder may not exist at all. `runs:/<RUN_ID>/<name>` works only when this run logged a model with that name. A wrong name gives `Failed to download artifacts from path 'model'`.
+
+#### Finding the model name
+
+Run this in the environment that wrote the database (the conda one here, not the `.venv`):
 
 ```python
-mlflow.get_run("<RUN_ID>").info.artifact_uri
+import mlflow
+mlflow.set_tracking_uri('sqlite:////Users/<you>/mlops/mlops-handson/experiment/mlflow.db')
+run = mlflow.get_run('<RUN_ID>')
+print(run.info.experiment_id)
+for m in mlflow.search_logged_models(experiment_ids=[run.info.experiment_id], output_format='list'):
+    print(m.name, m.model_id, m.source_run_id, m.artifact_location)
 ```
+
+The line whose `source_run_id` is your `RUN_ID` gives the `MODEL_ARTIFACT` (`name`) and the folder to use for `MLFLOW_ARTIFACTS_DIR` (the `mlruns` folder inside `artifact_location`). Use a path that starts with `/Users/...`. A location such as `mlflow-artifacts:/...` needs an MLflow server and cannot be loaded by this container.
 
 Create the files from the terminal if your editor or Finder hides names that start with a dot (`.env`, `.env.example`). `.env` only needs these lines:
 
@@ -1824,8 +1840,9 @@ cat > .env <<'EOF'
 SKLEARN_VERSION=
 MLFLOW_VERSION=
 RUN_ID=
-MODEL_ARTIFACT=model
+MODEL_ARTIFACT=model-rf
 MLFLOW_DIR=/Users/<you>/mlops/mlops-handson/experiment
+MLFLOW_ARTIFACTS_DIR=/Users/<you>/mlops/mlops-handson/hands-on1/mlruns
 IMAGE_TAG=latest
 EOF
 ```
@@ -1898,7 +1915,12 @@ A separate project folder, `oracle-stream/`, holds a production-style version of
 | Every prediction looks wrong, but nothing errors | The `PU_DO` feature does not match training (`43_151` vs `43.0_151.0`) |
 | Duplicate predictions after a restart | Expected after a crash between flush and commit (at-least-once). Downstream consumers should de-duplicate on `ride_id` |
 | `required variable RUN_ID is missing a value` (or `SKLEARN_VERSION`, `MLFLOW_VERSION`, `MLFLOW_DIR`) | `.env` is missing or incomplete. `cp .env.example .env` and fill it in |
-| The container starts but the model is not found | The run's artifact path is outside `MLFLOW_DIR`, or `MODEL_ARTIFACT` is wrong. Print `info.artifact_uri` and mount the folder that contains it |
+| `Failed to download artifacts from path 'model'` and the container keeps restarting | The run has no logged model with that name. Look the name up ("Finding the model name"), set `MODEL_ARTIFACT`, then `make down` and `make up` |
+| Same error, and the name is right | The model's folder is not mounted. Check `MLFLOW_ARTIFACTS_DIR` in `.env` and the second volume line of `service` in `docker-compose.yml`. Test from inside the container: `docker compose run --rm --no-deps --entrypoint ls service <path>` |
+| `ls .../<RUN_ID>/artifacts: No such file or directory` although the run exists | Normal with MLflow 3: models live under `.../models/m-<id>/`, not inside the run folder |
+| `make predict` fails with `curl: (7)` | The service is not up (`make ps`, `make logs`), or the Makefile has the wrong port. It must be `localhost:9696` |
+| `make up` always gives tag `-1`, or the echo says `runnung` | Typos in the Makefile: it needs `while docker image inspect ...` (with `docker`) and `echo "running ..."` |
+| `service` shows `Restarting` in `make ps` | The app crashes while loading the model. `docker compose logs service --tail 60` shows the exception |
 | Container shows `unhealthy` and `/health` has an `error` | The stream thread crashed (usually Kafka not reachable). `make logs` shows the traceback |
 | `pipenv install --dev install black ...` fails with `No matching distribution found for install` | The extra word `install` was taken as a package name. Remove `install = "*"` from the Pipfile and run `pipenv install --dev black isort pylint` |
 | `./tests/run_checks.sh`: `missing .env` | Create it first: `cp .env.example .env` |
