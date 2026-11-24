@@ -57,10 +57,9 @@ class Ride(BaseModel):
 
 def prepare_features(ride):
     # Must match training. Ints keep 43.0 from becoming "43.0_151.0".
-    return {
-        "PU_DO": "%s_%s" % (int(ride["PULocationID"]), int(ride["DOLocationID"])),
-        "trip_distance": float(ride["trip_distance"]),
-    }
+    pu = int(ride["PULocationID"])  # int() keeps 43.0 from becoming "43.0_151.0"
+    do = int(ride["DOLocationID"])
+    return {"PU_DO": f"{pu}_{do}", "trip_distance": float(ride["trip_distance"])}
 
 
 def predict(features_list):
