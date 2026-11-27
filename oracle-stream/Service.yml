@@ -1,0 +1,65 @@
+# service.py on Kubernetes: 3 copies behind one Service. `make k8s-up` fills in the __PLACEHOLDERS__ from .env.
+#
+# Two kinds of load balancing happen here, and they are different mechanisms:
+#   HTTP   (/predict): the Service below spreads connections over the copies that are Ready.
+#   Stream (`rides`) : Kafka gives each copy some of the 3 partitions, because every copy runs the
+#                      stream loop with the same group.id `duration-scorer`.
+
+apiVersion: app/v1
+kind: Deployment
+metadata:
+  name: duration-service
+  labels:
+    app: duration-service
+spec:
+  replicas: 3                                           # = partitions of `rides`; a 4th copy would get no partition
+  selector:
+    matchLabels:
+      app: duration-service
+  template:
+    metadata:
+      labels:
+        app: duration-service
+    specs:
+      initContainers:
+        # replaces `depends_on: topics: service_completed_successfully` from compose
+        - name: wait-for-topics
+          image: docker.redpanda.com/redpandadata/redpanda:v25.3.18
+          command: ["/bin/sh", "-c"]
+          args:
+           - until rpk -X brokers=redpanda:9092 topic list | grep -q predictions; do sleep 3; done
+      containers:
+        - name: service
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent    # built locally; there is no registry to pull from
+          command: ["uvicorn", "service:app", "--host", "0.0.0.0", "--port", "9696"]   # replaces the Dockerfile ENTRYPOINT
+          ports:
+           - containerPort: 9696
+          env:
+            - name: RUN_ID
+              value: "__RUN_ID__"
+            - name: MODEL_ARTIFACT
+              value: "__MODEL_ARTIFACT__"
+            - name: MLFLOW_TRACKING_URI
+              value: "sqlite:///__MLFLOW_DIR__/mlflow.db"
+            - name: KAFKA_BOOTSTRAP
+              value: "redpanda:9092"
+            - name: IN_TOPIC
+              value: "rides"
+            - name: OUT_TOPIC
+              value: "predictions"
+          volumeMounts:
+            # same path on both sides: MLflow stores absolute artifact paths
+            - name: mlflow-db
+              mountPath: __MLFLOW_DIR__
+            - name: mlflow-artifacts
+              mountPath: __MLFLOW_ARTIFACTS_DIR__
+              readOnly: true
+          # Ready = API up AND stream thread alive. Not Ready => the Service stops sending it HTTP calls.
+          readinessProbe:
+            exec:
+              command:
+               - python
+               - -c
+               - "import json,urllib.request as u; assert json.load(u.urlopen('http://localhost:9696/health', timeout=3))['streaming']"
+            
