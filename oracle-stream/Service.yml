@@ -1,61 +1,108 @@
-# Redpanda (Kafka API) inside the cluster. Same flags as docker-compose.yml.
-# The Service is called `redpanda`, so KAFKA_BOOTSTRAP=redpanda:9092 stays the same as in compose.
+# service.py on Kubernetes: 3 copies behind one Service. `make k8s-up` fills in the __PLACEHOLDERS__ from .env.
+#
+# Two kinds of load balancing happen here, and they are different mechanisms:
+#   HTTP   (/predict): the Service below spreads connections over the copies that are Ready.
+#   Stream (`rides`) : Kafka gives each copy some of the 3 partitions, because every copy runs the
+#                      stream loop with the same group.id `duration-scorer`.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: redpanda
+  name: duration-service
   labels:
-    app: redpanda
+    app: duration-service
 spec:
-  replicas: 1
+  replicas: 3                      # = partitions of `rides`; a 4th copy would get no partition
   selector:
     matchLabels:
-      app: redpanda
+      app: duration-service
   template:
     metadata:
       labels:
-        app: redpanda
+        app: duration-service
     spec:
-      containers:
-        - name: redpanda
+      initContainers:
+        # replaces `depends_on: topics: service_completed_successfully` from compose
+        - name: wait-for-topics
           image: docker.redpanda.com/redpandadata/redpanda:v25.3.18
+          command: ["/bin/sh", "-c"]
           args:
-            - redpanda
-            - start
-            - --mode=dev-container
-            - --smp=1
-            - --memory=1G
-            - --kafka-addr=0.0.0.0:9092
-            - --advertise-kafka-addr=redpanda:9092
+            - until rpk -X brokers=redpanda:9092 topic list | grep -q predictions; do sleep 3; done
+      containers:
+        - name: service
+          image: __IMAGE__
+          imagePullPolicy: IfNotPresent    # built locally; there is no registry to pull from
+          command: ["uvicorn", "service:app", "--host", "0.0.0.0", "--port", "9696"]   # replaces the Dockerfile ENTRYPOINT
           ports:
-            - containerPort: 9092
+            - containerPort: 9696
+          env:
+            - name: RUN_ID
+              value: "__RUN_ID__"
+            - name: MODEL_ARTIFACT
+              value: "__MODEL_ARTIFACT__"
+            - name: MLFLOW_TRACKING_URI
+              value: "sqlite:///__MLFLOW_DIR__/mlflow.db"
+            - name: KAFKA_BOOTSTRAP
+              value: "redpanda:9092"
+            - name: IN_TOPIC
+              value: "rides"
+            - name: OUT_TOPIC
+              value: "predictions"
+          volumeMounts:
+            # same path on both sides: MLflow stores absolute artifact paths
+            - name: mlflow-db
+              mountPath: __MLFLOW_DIR__
+            - name: mlflow-artifacts
+              mountPath: __MLFLOW_ARTIFACTS_DIR__
+              readOnly: true
+          # Ready = API up AND stream thread alive. Not Ready => the Service stops sending it HTTP calls.
           readinessProbe:
             exec:
-              command: ["/bin/sh", "-c", "rpk cluster health | grep -E 'Healthy:.+true'"]
-            initialDelaySeconds: 15
+              command:
+                - python
+                - -c
+                - "import json,urllib.request as u; assert json.load(u.urlopen('http://localhost:9696/health', timeout=3))['streaming']"
+            initialDelaySeconds: 20
             periodSeconds: 10
             timeoutSeconds: 5
-            failureThreshold: 12
+            failureThreshold: 3
+          # Same check, but failing it restarts the container (compose's `restart:` never did that for "unhealthy").
+          livenessProbe:
+            exec:
+              command:
+                - python
+                - -c
+                - "import json,urllib.request as u; assert json.load(u.urlopen('http://localhost:9696/health', timeout=3))['streaming']"
+            initialDelaySeconds: 90        
+            
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 6
           resources:
             requests:
-              memory: 1Gi
+              memory: 256Mi
+              cpu: 100m
             limits:
-              memory: 1536Mi
-          volumeMounts:
-            - name: data
-              mountPath: /var/lib/redpanda/data
+              memory: 1Gi
       volumes:
-        # dev only: topic data is lost when this pod is replaced (then run `make k8s-topics`)
-        - name: data
-          emptyDir: {}
+        # local-dev shortcut, as in compose. hostPath only works because this is one machine;
+        # in a real cluster the model is baked into the image or read from object storage.
+        - name: mlflow-db
+          hostPath:
+            path: __MLFLOW_DIR__
+            type: Directory
+        - name: mlflow-artifacts
+          hostPath:
+            path: __MLFLOW_ARTIFACTS_DIR__
+            type: Directory
 ---
 apiVersion: v1
 kind: Service
 metadata:
-  name: redpanda
+  name: duration-service
 spec:
+  type: LoadBalancer               # Docker Desktop publishes this on localhost:9696
   selector:
-    app: redpanda
+    app: duration-service
   ports:
-    - port: 9092
-      targetPort: 9092
+    - port: 9696
+      targetPort: 9696
