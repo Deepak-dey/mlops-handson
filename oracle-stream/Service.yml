@@ -62,4 +62,48 @@ spec:
                - python
                - -c
                - "import json,urllib.request as u; assert json.load(u.urlopen('http://localhost:9696/health', timeout=3))['streaming']"
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThurshold: 3
+            # Same check, but failing it restarts the container (compose's `restart:` never did that for "unhealthy").
+          livenessProbe: 
+            exec: 
+              command:
+                - python
+                - -c
+                - "import json,urllib.request as u; assert json.load(u.urlopen('http://localhost:9696/health', timeout=3))['streaming']"
+            initialDelaySeconds: 90 # the model is loaded when the app starts
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThurshold: 6
+          resources:
+            request:
+              memory: 256Mi
+              cpu: 100m
+            limits:
+              memory: 1Gi
+    volumes:
+      # local-dev shortcut, as in compose. hostPath only works because this is one machine;
+      # in a real cluster the model is baked into the image or read from object storage.
+      - name: mlflow-db
+        hostPath:
+          path: __MLFLOW_DIR__
+          type: Directory
+      - name: mlflow-artifacts
+        hostPath:
+          path: __MLFLOW_ARTIFACTS_DIR__
+          type: Directory
+---
+appVersion: v1
+kind: Service
+metadata:
+  name: duration-service
+spec:
+  type: LoadBalancer
+  selector:
+    app: duration-service
+  port:
+    - port: 9696
+      targetPort: 9696
             
